@@ -1,4 +1,5 @@
 import atexit
+import calendar
 import hashlib
 import io
 import json
@@ -59,14 +60,24 @@ PATH_HIT_LIMIT = 10
 # its outbound links.
 MIN_TEXT_DENSITY = 0.05
 
-# Rule E: after tokenization, pages with fewer than this many "meaningful"
-# tokens (alphanumeric runs of length >= 2 from the HW1 tokenizer) are thin
-# caption/list pages — not enough prose to justify crawling their out-links.
-MIN_CONTENT_TOKENS = 20
+# Rule E: pages with fewer than this many *report-eligible* words (see
+# _meaningful_tokens_from_text) are thin — do not propagate out-links.
+MIN_CONTENT_TOKENS = 18
 
-# Minimum token length when counting words for the report (longest page,
-# word frequencies). Single-character runs are not English words.
-MIN_TOKEN_LEN_FOR_ANALYTICS = 2
+# For Q2/Q3 only (after HW1 tokenize): English-ish tokens, not citation noise.
+# - Letters only: drops "18", "5x", "3o", etc.
+# - Minimum length 3: drops "ny", two-letter state codes, single doubled chars.
+MIN_REPORT_WORD_LEN = 3
+
+# Month names/abbrevs appear on almost every dated page; they dominated Q3.
+# Built from the stdlib calendar tables (locale-independent English) rather
+# than hand-maintaining strings. "sept" is a common written form; month_abbr
+# only exposes "sep".
+REPORT_MONTH_STOPWORDS = frozenset(
+    calendar.month_abbr[i].lower() for i in range(1, 13)
+) | frozenset(calendar.month_name[i].lower() for i in range(1, 13)) | frozenset(
+    {"sept"}
+)
 
 # Persisted state and report file locations (relative to project root).
 STOP_WORDS_FILE = "stop_words.txt"
@@ -117,8 +128,18 @@ def tokenize(text):
 
 
 def _meaningful_tokens_from_text(text):
-    # For word-count / longest-page report stats: drop 1-character "words".
-    return [t for t in tokenize(text) if len(t) >= MIN_TOKEN_LEN_FOR_ANALYTICS]
+    # HW1 tokenize(), then Q2/Q3 filters (instructions require stop_words.txt only;
+    # this extra filter removes digits/mixed-alnum citation junk and month noise).
+    eligible = []
+    for token in tokenize(text):
+        if len(token) < MIN_REPORT_WORD_LEN:
+            continue
+        if not token.isalpha():
+            continue
+        if token in REPORT_MONTH_STOPWORDS:
+            continue
+        eligible.append(token)
+    return eligible
 
 
 # ============================================================
@@ -424,7 +445,7 @@ def _has_disallowed_extension(path):
             r"|odp|ods|odt|odg"
             r"|key|pages|numbers"
             r"|ipynb|nb|wasm|ipa|pkg|deb|rpm|xz|lzma|zst"
-            r"|rm|smil|wmv|swf|wma|zip|rar|gz)$",
+            r"|rm|smil|wmv|swf|wma|zip|rar|gz|ff)$",
             path.lower(),
         )
     )
