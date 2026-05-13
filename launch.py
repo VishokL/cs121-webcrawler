@@ -1,5 +1,6 @@
 from configparser import ConfigParser
 from argparse import ArgumentParser
+import multiprocessing
 
 from utils.server_registration import get_cache_server
 from utils.config import Config
@@ -7,6 +8,11 @@ from crawler import Crawler
 
 
 def main(config_file, restart):
+    # macOS requires 'fork' method for multiprocessing to work with spacetime
+    try:
+        multiprocessing.set_start_method('fork', force=True)
+    except RuntimeError:
+        pass
     cparser = ConfigParser()
     cparser.read(config_file)
     config = Config(cparser)
