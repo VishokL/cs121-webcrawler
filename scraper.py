@@ -52,6 +52,19 @@ MAX_QUERY_PARAMS = 3
 # while cutting off combinatorial traps quickly.
 PATH_HIT_LIMIT = 10
 
+# Rule E: sequential-page traps — once we accept this many URLs whose filename
+# is a bare number or a word-plus-number (nodeN, slideN, pageN, itemN), reject
+# further URLs with the same (host, directory) prefix. This catches things like
+# /slides/node1.html … /slides/node200.html without hard-capping legitimate
+# blog directories where post slugs are words, not numbers.
+SEQUENTIAL_PAGE_LIMIT = 30
+
+# Per-source-page cap: a single page may contribute at most this many links
+# pointing at the same target directory. Without this, a slide index that
+# enumerates 100 sibling nodes would dump all 100 into the frontier in one
+# extraction call — long before the sequential counter could catch up.
+MAX_SAME_DIR_PER_PAGE = 5
+
 # Rule C: ratio of visible-text bytes to total HTML bytes below which a page
 # is treated as low-information (UI / navigation chrome rather than content).
 # When this is hit we still count the URL as visited but do not propagate
@@ -95,6 +108,10 @@ def _empty_analytics():
         # Rule A state: how many times we've crawled each (host, path) regardless
         # of query string. Key format: "<hostname><path>" (e.g. "wiki.ics.uci.edu/doku.php/foo").
         "path_hits": defaultdict(int),
+        # Rule E state: count of sequential-named filenames (nodeN, slideN, pageN,
+        # etc.) accepted per (host, directory). Only these patterns trigger the cap —
+        # word-slug filenames (real blog posts) are not counted here.
+        "seq_dir_hits": defaultdict(int),
         # Rule D state: fingerprints of normalized page text we have already seen,
         # used to skip propagating links from exact-duplicate pages.
         "content_hashes": set(),
@@ -122,6 +139,7 @@ def load_analytics(path):
             },
         ),
         "path_hits": defaultdict(int, saved_state.get("path_hits", {})),
+        "seq_dir_hits": defaultdict(int, saved_state.get("seq_dir_hits", {})),
         "content_hashes": set(saved_state.get("content_hashes", [])),
     }
 
@@ -141,6 +159,7 @@ def save_analytics(path=ANALYTICS_FILE):
             for hostname, urls in analytics["subdomain_pages"].items()
         },
         "path_hits": dict(analytics["path_hits"]),
+        "seq_dir_hits": dict(analytics["seq_dir_hits"]),
         "content_hashes": sorted(analytics["content_hashes"]),
     }
     with open(path, "w", encoding="utf-8") as analytics_file:
@@ -237,6 +256,7 @@ def extract_next_links(url, resp):
     # of (N source pages) × (~50 variants each).
     extracted_links = []
     seen_target_path_keys = set()
+    target_dir_counts = Counter()
     for anchor_tag in soup.find_all("a", href=True):
         href_value = anchor_tag["href"].strip()
         if not href_value:
@@ -257,6 +277,13 @@ def extract_next_links(url, resp):
         if target_path_key in seen_target_path_keys:
             continue
         seen_target_path_keys.add(target_path_key)
+
+        target_hostname = (parsed_target.hostname or "").lower()
+        target_dir_key = _dir_key(target_hostname, parsed_target.path)
+        if target_dir_counts[target_dir_key] >= MAX_SAME_DIR_PER_PAGE:
+            continue
+        target_dir_counts[target_dir_key] += 1
+
         extracted_links.append(defragmented_url)
 
     return extracted_links
@@ -277,6 +304,9 @@ def is_valid(url):
         if _has_disallowed_extension(parsed_url.path):
             return False
 
+        if _is_pagination_archive(parsed_url.path):
+            return False
+
         if len(url) > MAX_URL_LENGTH:
             return False
         if _has_too_many_path_segments(parsed_url.path):
@@ -291,7 +321,16 @@ def is_valid(url):
             return False
         if _path_hit_limit_reached(parsed_url, hostname):
             return False
+        if _seq_dir_limit_reached(parsed_url, hostname):
+            return False
 
+        # Reserve a slot in the sequential-dir budget (if applicable) and the
+        # query-variant budget now, at extraction time, so burst extractions
+        # can't blow past the limits before any of them are actually crawled.
+        if _is_sequential_filename(parsed_url.path):
+            analytics["seq_dir_hits"][_dir_key(hostname, parsed_url.path)] += 1
+        if parsed_url.query:
+            analytics["path_hits"][_path_key(hostname, parsed_url.path)] += 1
         return True
 
     except TypeError:
@@ -337,9 +376,10 @@ def _has_disallowed_extension(path):
             r".*\.(css|js|bmp|gif|jpe?g|ico"
             r"|png|tiff?|mid|mp2|mp3|mp4"
             r"|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
-            r"|ps|eps|tex|ppt|pptx|doc|docx|xls|xlsx|names"
+            r"|ps|eps|tex|ppt|pptx|pps|ppsx|pptm|ppsm"
+            r"|doc|docx|docm|xls|xlsx|xlsm|names"
             r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
-            r"|epub|dll|cnf|tgz|sha1"
+            r"|epub|dll|cnf|tgz|sha1|ipynb|nb"
             r"|thmx|mso|arff|rtf|jar|war|ear|apk|csv"
             r"|rm|smil|wmv|swf|wma|zip|rar|gz)$",
             path.lower(),
@@ -417,6 +457,16 @@ def _is_non_html_export_query(query):
     )
 
 
+def _is_pagination_archive(path):
+    # WordPress and similar CMSes generate paginated archive views at paths
+    # like /blog/page/3/, /author/ramesh/page/12/, /category/news/page/5/.
+    # These pages list the same posts that are reachable directly from the
+    # first listing page; crawling page/50 adds no new content, just reraises
+    # duplicate links. Block any path whose last numeric component is reached
+    # via a /page/ segment.
+    return bool(re.search(r"/page/\d+(/|$)", path, re.IGNORECASE))
+
+
 def _has_too_many_query_params(query):
     # Rule B: a URL with many query parameters is almost always a dynamically
     # generated view (filter/sort/paginate/faceted-search) rather than a unique
@@ -440,6 +490,35 @@ def _path_hit_limit_reached(parsed_url, hostname):
 
 def _path_key(hostname, path):
     return f"{hostname}{path}"
+
+
+def _dir_key(hostname, path):
+    # Directory prefix: everything up to and including the last slash.
+    dir_prefix = path.rsplit("/", 1)[0] + "/"
+    return f"{hostname}{dir_prefix}"
+
+
+# Matches filenames that are purely numeric or a short word plus a number:
+# node118, slide42, page7, item3, 0042, etc. These are sequential indexing
+# patterns found in slide traps, not human-readable content slugs.
+_SEQUENTIAL_FILENAME_RE = re.compile(
+    r"^(?:[a-z]{0,10})?(\d+)(\.html?)?$", re.IGNORECASE
+)
+
+
+def _is_sequential_filename(path):
+    filename = path.rsplit("/", 1)[-1]
+    return bool(_SEQUENTIAL_FILENAME_RE.match(filename))
+
+
+def _seq_dir_limit_reached(parsed_url, hostname):
+    # Rule E: only count and limit URLs whose filename looks sequential.
+    # Regular blog post slugs ("towards-weaving-the-visual-web") are not
+    # affected; only numeric-indexed files (node42.html, slide7) are capped.
+    if not _is_sequential_filename(parsed_url.path):
+        return False
+    dir_key = _dir_key(hostname, parsed_url.path)
+    return analytics["seq_dir_hits"].get(dir_key, 0) >= SEQUENTIAL_PAGE_LIMIT
 
 
 def _has_sufficient_text_density(page_text, page_bytes):
@@ -470,11 +549,9 @@ def record_page_analytics(page_url, page_text, is_content_bearing):
     parsed = urlparse(defragmented_url)
     hostname = (parsed.hostname or "").lower()
 
-    # The per-path counter feeds Rule A. We bump it on every successful crawl
-    # regardless of content quality, because the trap signal is the number of
-    # distinct query variants we have already burned, not whether each variant
-    # carried any text.
-    analytics["path_hits"][_path_key(hostname, parsed.path)] += 1
+    # Note: path_hits and seq_dir_hits are reserved in is_valid at extraction
+    # time, not here, so bursts of same-dir links from a single source page
+    # can't blow past their limits before any of them are actually crawled.
 
     is_new_url = defragmented_url not in analytics["unique_urls"]
     if is_new_url:
@@ -501,7 +578,11 @@ def record_page_analytics(page_url, page_text, is_content_bearing):
 
 
 def tokenize(text):
-    return [match.lower() for match in re.findall(r"[a-zA-Z]+", text)]
+    # Require at least 2 characters: single-letter tokens are almost always
+    # noise (binary-file decoding artifacts, variable names from code blocks,
+    # or stop words like "a"/"I") and dominated the previous run's word
+    # counts when a .ppsx slipped through.
+    return [match.lower() for match in re.findall(r"[a-zA-Z]{2,}", text)]
 
 
 # Allow `python3 scraper.py` to generate the report from saved analytics.
