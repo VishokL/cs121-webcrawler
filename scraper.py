@@ -1,4 +1,5 @@
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -29,9 +30,30 @@ MIN_PAGE_BYTES = 500
 MAX_PAGE_BYTES = 5_000_000
 
 # Heuristics for trap detection in is_valid.
+#
+# These rules describe what makes a URL look like a "low information value"
+# page in observable terms (URL shape and observed crawl behavior), rather
+# than naming specific sites. The thresholds were chosen by inspecting
+# Logs/Worker.log and confirming that legitimate UCI pages stay well below
+# them while combinatorial trap pages exceed them rapidly.
 MAX_URL_LENGTH = 300
 MAX_PATH_SEGMENTS = 8
 MAX_PATH_SEGMENT_REPEATS = 2
+
+# Rule B: pages with many query parameters are usually dynamically-generated
+# filter/sort/paginate views with little marginal content.
+MAX_QUERY_PARAMS = 3
+
+# Rule A: once we have crawled this many distinct query-string variants of a
+# single (host, path), assume any further variant is part of a combinatorial
+# trap (DokuWiki media manager, calendar pickers, faceted search, etc.).
+PATH_HIT_LIMIT = 25
+
+# Rule C: ratio of visible-text bytes to total HTML bytes below which a page
+# is treated as low-information (UI / navigation chrome rather than content).
+# When this is hit we still count the URL as visited but do not propagate
+# its outbound links.
+MIN_TEXT_DENSITY = 0.05
 
 # Persisted state and report file locations (relative to project root).
 STOP_WORDS_FILE = "stop_words.txt"
@@ -67,6 +89,12 @@ def _empty_analytics():
         "longest_page_word_count": 0,
         "word_counts": Counter(),
         "subdomain_pages": defaultdict(set),
+        # Rule A state: how many times we've crawled each (host, path) regardless
+        # of query string. Key format: "<hostname><path>" (e.g. "wiki.ics.uci.edu/doku.php/foo").
+        "path_hits": defaultdict(int),
+        # Rule D state: fingerprints of normalized page text we have already seen,
+        # used to skip propagating links from exact-duplicate pages.
+        "content_hashes": set(),
     }
 
 
@@ -90,6 +118,8 @@ def load_analytics(path):
                 for hostname, urls in saved_state.get("subdomain_pages", {}).items()
             },
         ),
+        "path_hits": defaultdict(int, saved_state.get("path_hits", {})),
+        "content_hashes": set(saved_state.get("content_hashes", [])),
     }
 
 
@@ -107,6 +137,8 @@ def save_analytics(path=ANALYTICS_FILE):
             hostname: sorted(urls)
             for hostname, urls in analytics["subdomain_pages"].items()
         },
+        "path_hits": dict(analytics["path_hits"]),
+        "content_hashes": sorted(analytics["content_hashes"]),
     }
     with open(path, "w", encoding="utf-8") as analytics_file:
         json.dump(snapshot, analytics_file, indent=2)
@@ -172,7 +204,26 @@ def extract_next_links(url, resp):
     except Exception:
         return []
 
-    record_page_analytics(base_url, soup)
+    page_text = soup.get_text(separator=" ")
+
+    # Rule C: pages with very little visible text relative to their HTML
+    # payload are UI / navigation pages, not content. Rule D: pages whose
+    # normalized text matches a previously-seen page are exact duplicates.
+    # In either case we still want to count the URL as visited (so the
+    # unique-page count reflects reality), but we should not propagate the
+    # outbound links — that's what fuels combinatorial traps.
+    is_content_bearing = _has_sufficient_text_density(page_text, page_bytes)
+    if is_content_bearing:
+        content_hash = _content_fingerprint(page_text)
+        if content_hash in analytics["content_hashes"]:
+            is_content_bearing = False
+        else:
+            analytics["content_hashes"].add(content_hash)
+
+    record_page_analytics(base_url, page_text, is_content_bearing)
+
+    if not is_content_bearing:
+        return []
 
     extracted_links = []
     for anchor_tag in soup.find_all("a", href=True):
@@ -209,6 +260,10 @@ def is_valid(url):
         if _has_repeated_path_segments(parsed_url.path):
             return False
         if _looks_like_calendar_trap(parsed_url):
+            return False
+        if _has_too_many_query_params(parsed_url.query):
+            return False
+        if _path_hit_limit_reached(parsed_url, hostname):
             return False
 
         return True
@@ -287,28 +342,82 @@ def _looks_like_calendar_trap(parsed_url):
     return False
 
 
-def record_page_analytics(page_url, soup):
+def _has_too_many_query_params(query):
+    # Rule B: a URL with many query parameters is almost always a dynamically
+    # generated view (filter/sort/paginate/faceted-search) rather than a unique
+    # content page. We allow up to MAX_QUERY_PARAMS for normal use cases.
+    if not query:
+        return False
+    param_count = sum(1 for pair in query.split("&") if pair)
+    return param_count > MAX_QUERY_PARAMS
+
+
+def _path_hit_limit_reached(parsed_url, hostname):
+    # Rule A: combinatorial trap detection. If we have already crawled many
+    # variants of this (host, path) under different query strings, refuse any
+    # further variant. URLs without a query string are always allowed through,
+    # so the canonical page itself is never blocked.
+    if not parsed_url.query:
+        return False
+    path_key = _path_key(hostname, parsed_url.path)
+    return analytics["path_hits"].get(path_key, 0) >= PATH_HIT_LIMIT
+
+
+def _path_key(hostname, path):
+    return f"{hostname}{path}"
+
+
+def _has_sufficient_text_density(page_text, page_bytes):
+    # Rule C: ratio of visible text bytes to total HTML bytes. Pages that are
+    # mostly markup with little actual prose tend to be UI/action views.
+    if not page_bytes:
+        return False
+    text_bytes = len(page_text.encode("utf-8", errors="ignore"))
+    return text_bytes / len(page_bytes) >= MIN_TEXT_DENSITY
+
+
+def _content_fingerprint(page_text):
+    # Rule D: stable hash over normalized text so two pages that render the
+    # same prose (modulo whitespace and casing) collide. Used to detect exact
+    # near-duplicates such as DokuWiki action variants that all wrap the same
+    # underlying article.
+    normalized_text = " ".join(page_text.lower().split())
+    return hashlib.md5(normalized_text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def record_page_analytics(page_url, page_text, is_content_bearing):
     global _pages_since_last_save
 
     defragmented_url, _fragment = urldefrag(page_url)
-    if not defragmented_url or defragmented_url in analytics["unique_urls"]:
+    if not defragmented_url:
         return
-    analytics["unique_urls"].add(defragmented_url)
 
-    page_text = soup.get_text(separator=" ")
-    page_words = tokenize(page_text)
+    parsed = urlparse(defragmented_url)
+    hostname = (parsed.hostname or "").lower()
 
-    if len(page_words) > analytics["longest_page_word_count"]:
-        analytics["longest_page_word_count"] = len(page_words)
-        analytics["longest_page_url"] = defragmented_url
+    # The per-path counter feeds Rule A. We bump it on every successful crawl
+    # regardless of content quality, because the trap signal is the number of
+    # distinct query variants we have already burned, not whether each variant
+    # carried any text.
+    analytics["path_hits"][_path_key(hostname, parsed.path)] += 1
 
-    for word in page_words:
-        if word not in STOP_WORDS:
-            analytics["word_counts"][word] += 1
+    is_new_url = defragmented_url not in analytics["unique_urls"]
+    if is_new_url:
+        analytics["unique_urls"].add(defragmented_url)
+        if hostname == "uci.edu" or hostname.endswith(".uci.edu"):
+            analytics["subdomain_pages"][hostname].add(defragmented_url)
 
-    hostname = (urlparse(defragmented_url).hostname or "").lower()
-    if hostname == "uci.edu" or hostname.endswith(".uci.edu"):
-        analytics["subdomain_pages"][hostname].add(defragmented_url)
+    # Only content-bearing pages contribute to the longest-page and word-count
+    # analytics. UI / duplicate pages would otherwise drown the report in
+    # boilerplate words ("edit", "preview", "namespace", "history", ...).
+    if is_content_bearing and is_new_url:
+        page_words = tokenize(page_text)
+        if len(page_words) > analytics["longest_page_word_count"]:
+            analytics["longest_page_word_count"] = len(page_words)
+            analytics["longest_page_url"] = defragmented_url
+        for word in page_words:
+            if word not in STOP_WORDS:
+                analytics["word_counts"][word] += 1
 
     _pages_since_last_save += 1
     if _pages_since_last_save >= SAVE_EVERY_N_PAGES:
