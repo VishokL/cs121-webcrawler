@@ -3,9 +3,12 @@ import json
 import os
 import re
 from collections import Counter, defaultdict
-from urllib.parse import urldefrag, urljoin, urlparse
+from threading import RLock
+from urllib.parse import urldefrag, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
+
+from utils import get_logger
 
 
 # ============================================================
@@ -13,8 +16,6 @@ from bs4 import BeautifulSoup
 # ============================================================
 
 # The four domains we are allowed to crawl, per the assignment spec.
-# Any hostname that equals one of these or has it as a dotted suffix
-# (e.g. "vision.ics.uci.edu" ends with ".ics.uci.edu") is in scope.
 ALLOWED_DOMAINS = (
     "ics.uci.edu",
     "cs.uci.edu",
@@ -22,24 +23,127 @@ ALLOWED_DOMAINS = (
     "stat.uci.edu",
 )
 
-# Skip pages whose raw byte length is outside this range. The lower bound
-# guards against "dead" 200-OK pages with no real content; the upper bound
-# guards against very large files with low information value.
+# Page-size guards (raw byte length).
 MIN_PAGE_BYTES = 500
 MAX_PAGE_BYTES = 5_000_000
 
-# Heuristics for trap detection in is_valid.
-MAX_URL_LENGTH = 300
+# Trap heuristics applied in is_valid().
+MAX_URL_LENGTH = 250
 MAX_PATH_SEGMENTS = 8
 MAX_PATH_SEGMENT_REPEATS = 2
+MAX_QUERY_PARAMS = 6
+MAX_PAGED_VALUE = 50
 
-# Persisted state and report file locations (relative to project root).
+# When a single host crosses this page count we emit a warning so a human
+# can decide whether it's a trap. Not a hard cap.
+SOFT_HOST_PAGE_CAP = 5_000
+
+# Persisted state and report file locations.
 STOP_WORDS_FILE = "stop_words.txt"
 ANALYTICS_FILE = "analytics.json"
 REPORT_FILE = "report.txt"
 
 # Flush analytics to disk every N newly-crawled pages.
 SAVE_EVERY_N_PAGES = 25
+# Log a scraper summary every N newly-crawled pages.
+SUMMARY_EVERY_N_PAGES = 50
+
+
+# ============================================================
+# Logger and counters
+# ============================================================
+
+logger = get_logger("SCRAPER", "Scraper")
+
+# Single re-entrant lock guards every mutation of the analytics dict and
+# the diagnostic counters below. Re-entrant because record_page_analytics
+# may call save_analytics / log_summary, which also acquire the lock.
+_state_lock = RLock()
+
+# Per-rejection-reason counters. Reset only on process restart.
+filter_reason_counts = Counter()
+page_skip_reason_counts = Counter()
+
+
+# ============================================================
+# Patterns
+# ============================================================
+
+DISALLOWED_EXTENSION_RE = re.compile(
+    r".*\.(css|js|bmp|gif|jpe?g|ico"
+    r"|png|tiff?|mid|mp2|mp3|mp4"
+    r"|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
+    r"|ps|eps|tex|ppt|pptx|doc|docx|xls|xlsx|names"
+    r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
+    r"|epub|dll|cnf|tgz|sha1"
+    r"|thmx|mso|arff|rtf|jar|csv"
+    r"|rm|smil|wmv|swf|wma|zip|rar|gz"
+    r"|svg|woff2?|ttf|eot|otf"
+    r"|ipynb|mat|class|odp|ods|odt|pps|ppsx"
+    r"|sql|war|apk|deb|rpm|img)$",
+    re.IGNORECASE,
+)
+
+CALENDAR_PATH_PATTERNS = (
+    # "things that end with a date"
+    re.compile(r"/\d{4}-\d{2}-\d{2}(/|$)"),
+    re.compile(r"/\d{4}/\d{1,2}/\d{1,2}(/|$)"),
+    re.compile(r"/\d{4}/\d{1,2}(/|$)"),
+    # "events / cal / calendar / archive" sections keyed by year
+    re.compile(r"/(events?|cal|calendar|archive)/\d{4}", re.IGNORECASE),
+    # "things that end with events week" — also month/day/list/upcoming/past
+    re.compile(
+        r"/(events?|cal|calendar)/(week|month|day|list|upcoming|past)(/|$)",
+        re.IGNORECASE,
+    ),
+)
+
+CALENDAR_QUERY_KEYS = {
+    "year", "month", "day", "date", "when",
+    "tribe-bar-date", "eventdisplay", "ical",
+    "from", "to", "start_date", "end_date",
+}
+
+# Query keys that signal a duplicate/auxiliary view of a page that the
+# crawler will already see through some other (canonical) link.
+DUPLICATE_VIEW_QUERY_KEYS = {
+    "replytocom",     # WordPress comment-reply links — infinite
+    "share",
+    "like_comment",
+    "action",         # MediaWiki edit/history/diff actions
+    "diff",
+    "oldid",
+    "do",             # DokuWiki actions (login/edit/diff/...)
+    "rev",            # DokuWiki revision history — creates infinite old-version URLs
+    "idx",            # DokuWiki namespace index pages
+    "printable",
+    "format",         # alternative-format duplicates (json/xml/atom)
+    "attachment_id",
+    "preview",
+    "print",
+    "redirect_to",
+    "returnurl",
+    "sessionid",
+    "sid",
+    "phpsessid",
+    "outlook-ical",
+    "ver",
+}
+
+# Substrings that mean "this is an admin / auth / feed page, not content."
+SKIP_PATH_TOKENS = (
+    "/login", "/logout", "/signin", "/signup", "/register",
+    "/wp-admin", "/wp-login", "/xmlrpc",
+    "/feed", "/rss", "/atom", "/trackback",
+    "/zip-attachment/",  # DokuWiki binary attachment downloads
+)
+
+# GitLab/Gitea/cgit views with effectively-infinite hash- or branch-based URLs.
+GIT_VIEW_PATTERNS = (
+    re.compile(r"/-/(commit|blob|tree|raw|blame|compare)/", re.IGNORECASE),
+    re.compile(r"/commit/[0-9a-f]{7,}", re.IGNORECASE),
+    re.compile(r"/raw/[^/]+/", re.IGNORECASE),
+)
 
 
 # ============================================================
@@ -54,6 +158,36 @@ def load_stop_words(path):
 
 
 STOP_WORDS = load_stop_words(STOP_WORDS_FILE)
+
+
+# ============================================================
+# URL canonicalization
+# ============================================================
+
+def canonicalize_url(url):
+    """Return a canonical form of a URL for dedup and frontier consistency.
+
+    Lowercases scheme/host, strips default ports, collapses duplicate slashes,
+    removes trailing slash from non-root paths, and drops the fragment.
+    Returns "" if the URL cannot be parsed.
+    """
+    if not url:
+        return ""
+    try:
+        defragged, _ = urldefrag(url.strip())
+        parsed = urlparse(defragged)
+    except (TypeError, ValueError):
+        return ""
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    if scheme == "http" and netloc.endswith(":80"):
+        netloc = netloc[:-3]
+    elif scheme == "https" and netloc.endswith(":443"):
+        netloc = netloc[:-4]
+    path = re.sub(r"/+", "/", parsed.path or "")
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    return urlunparse((scheme, netloc, path, parsed.params, parsed.query, ""))
 
 
 # ============================================================
@@ -75,39 +209,54 @@ def load_analytics(path):
         return _empty_analytics()
     try:
         with open(path, encoding="utf-8") as analytics_file:
-            saved_state = json.load(analytics_file)
+            saved = json.load(analytics_file)
     except (json.JSONDecodeError, OSError):
         return _empty_analytics()
+
+    # Re-canonicalize on load so an older non-canonical analytics file dedupes.
+    canonical_urls = set()
+    for raw in saved.get("unique_urls", []):
+        canonical = canonicalize_url(raw)
+        if canonical:
+            canonical_urls.add(canonical)
+
+    subdomain_pages = defaultdict(set)
+    for hostname, urls in saved.get("subdomain_pages", {}).items():
+        host = hostname.lower()
+        for raw in urls:
+            canonical = canonicalize_url(raw)
+            if canonical:
+                subdomain_pages[host].add(canonical)
+
     return {
-        "unique_urls": set(saved_state.get("unique_urls", [])),
-        "longest_page_url": saved_state.get("longest_page_url", ""),
-        "longest_page_word_count": saved_state.get("longest_page_word_count", 0),
-        "word_counts": Counter(saved_state.get("word_counts", {})),
-        "subdomain_pages": defaultdict(
-            set,
-            {
-                hostname: set(urls)
-                for hostname, urls in saved_state.get("subdomain_pages", {}).items()
-            },
-        ),
+        "unique_urls": canonical_urls,
+        "longest_page_url": saved.get("longest_page_url", ""),
+        "longest_page_word_count": saved.get("longest_page_word_count", 0),
+        "word_counts": Counter(saved.get("word_counts", {})),
+        "subdomain_pages": subdomain_pages,
     }
 
 
 analytics = load_analytics(ANALYTICS_FILE)
 _pages_since_last_save = 0
+_pages_since_last_summary = 0
 
 
 def save_analytics(path=ANALYTICS_FILE):
-    snapshot = {
-        "unique_urls": sorted(analytics["unique_urls"]),
-        "longest_page_url": analytics["longest_page_url"],
-        "longest_page_word_count": analytics["longest_page_word_count"],
-        "word_counts": dict(analytics["word_counts"]),
-        "subdomain_pages": {
-            hostname: sorted(urls)
-            for hostname, urls in analytics["subdomain_pages"].items()
-        },
-    }
+    # Build the snapshot under the lock so concurrent writers can't mutate
+    # the dicts/sets/Counters mid-serialization. The file write itself
+    # happens outside the lock since it doesn't touch shared state.
+    with _state_lock:
+        snapshot = {
+            "unique_urls": sorted(analytics["unique_urls"]),
+            "longest_page_url": analytics["longest_page_url"],
+            "longest_page_word_count": analytics["longest_page_word_count"],
+            "word_counts": dict(analytics["word_counts"]),
+            "subdomain_pages": {
+                hostname: sorted(urls)
+                for hostname, urls in analytics["subdomain_pages"].items()
+            },
+        }
     with open(path, "w", encoding="utf-8") as analytics_file:
         json.dump(snapshot, analytics_file, indent=2)
 
@@ -118,9 +267,7 @@ atexit.register(save_analytics)
 def generate_report(path=REPORT_FILE):
     """Write answers to the four report questions to a text file."""
     lines = []
-    lines.append(
-        f"1. Unique pages found: {len(analytics['unique_urls'])}\n\n"
-    )
+    lines.append(f"1. Unique pages found: {len(analytics['unique_urls'])}\n\n")
     lines.append(
         "2. Longest page (by word count): "
         f"{analytics['longest_page_url']} "
@@ -156,66 +303,98 @@ def extract_next_links(url, resp):
     # resp.status: the status code returned by the server (200 is OK)
     # resp.error: when status is not 200, this contains the error
     # resp.raw_response: the underlying response object
-    #     resp.raw_response.url: the url, again
-    #     resp.raw_response.content: the raw HTML bytes of the page
     if not _is_successful_response(resp):
         return []
 
     page_bytes = resp.raw_response.content
     if not _has_acceptable_size(page_bytes):
+        _bump_page_skip("too_small" if len(page_bytes) < MIN_PAGE_BYTES else "too_large")
         return []
 
-    base_url = resp.raw_response.url or resp.url or url
+    raw_base = resp.raw_response.url or resp.url or url
+    base_url = canonicalize_url(raw_base) or raw_base
 
     try:
         soup = BeautifulSoup(page_bytes, "html.parser")
-    except Exception:
+    except Exception as exc:
+        logger.warning(f"BeautifulSoup failed for {raw_base}: {exc}")
+        _bump_page_skip("bs4_error")
         return []
 
     record_page_analytics(base_url, soup)
 
-    extracted_links = []
-    for anchor_tag in soup.find_all("a", href=True):
-        href_value = anchor_tag["href"].strip()
-        if not href_value:
+    seen_on_page = set()
+    extracted = []
+    anchor_count = 0
+    for anchor in soup.find_all("a", href=True):
+        anchor_count += 1
+        href = anchor["href"].strip()
+        if not href or href.startswith(("mailto:", "javascript:", "tel:")):
             continue
-        absolute_url = urljoin(base_url, href_value)
-        defragmented_url, _fragment = urldefrag(absolute_url)
-        if defragmented_url:
-            extracted_links.append(defragmented_url)
+        absolute = urljoin(raw_base, href)
+        canonical = canonicalize_url(absolute)
+        if not canonical or canonical in seen_on_page:
+            continue
+        seen_on_page.add(canonical)
+        extracted.append(canonical)
 
-    return extracted_links
+    return extracted
 
 
 def is_valid(url):
     # Decide whether to crawl this url or not.
-    # Returns True if the url should be added to the frontier, False otherwise.
     try:
-        parsed_url = urlparse(url)
-        if parsed_url.scheme not in {"http", "https"}:
-            return False
+        parsed = urlparse(url)
+    except (TypeError, ValueError):
+        return _reject("parse_failed")
 
-        hostname = (parsed_url.hostname or "").lower()
-        if not _is_in_allowed_domains(hostname):
-            return False
+    if parsed.scheme not in ("http", "https"):
+        return _reject("scheme")
 
-        if _has_disallowed_extension(parsed_url.path):
-            return False
+    hostname = (parsed.hostname or "").lower()
+    if not _is_in_allowed_domains(hostname):
+        return _reject("out_of_domain")
 
-        if len(url) > MAX_URL_LENGTH:
-            return False
-        if _has_too_many_path_segments(parsed_url.path):
-            return False
-        if _has_repeated_path_segments(parsed_url.path):
-            return False
-        if _looks_like_calendar_trap(parsed_url):
-            return False
+    if _has_disallowed_extension(parsed.path):
+        return _reject("bad_extension")
 
-        return True
+    if len(url) > MAX_URL_LENGTH:
+        return _reject("url_too_long")
 
-    except TypeError:
-        print("TypeError for ", parsed_url)
-        raise
+    if _has_skip_path_token(parsed.path):
+        return _reject("admin_or_feed_path")
+
+    if _has_too_many_path_segments(parsed.path):
+        return _reject("too_many_path_segments")
+
+    if _has_repeated_path_segments(parsed.path):
+        return _reject("repeated_path_segments")
+
+    if _has_adjacent_repeated_segments(parsed.path):
+        return _reject("adjacent_repeated_segments")
+
+    if _is_calendar_trap(parsed):
+        return _reject("calendar_trap")
+
+    if _has_duplicate_view_query(parsed.query):
+        return _reject("duplicate_view_query")
+
+    if _has_too_many_query_params(parsed.query):
+        return _reject("too_many_query_params")
+
+    if _has_runaway_pagination(parsed.query):
+        return _reject("runaway_pagination")
+
+    if _is_git_view(parsed.path):
+        return _reject("git_view")
+
+    return True
+
+
+def _reject(reason):
+    with _state_lock:
+        filter_reason_counts[reason] += 1
+    return False
 
 
 # ============================================================
@@ -224,12 +403,20 @@ def is_valid(url):
 
 def _is_successful_response(resp):
     if resp.status != 200:
+        _bump_page_skip(f"status_{resp.status}")
         return False
     if resp.raw_response is None:
+        _bump_page_skip("no_raw_response")
         return False
     if not resp.raw_response.content:
+        _bump_page_skip("empty_content")
         return False
     return True
+
+
+def _bump_page_skip(reason):
+    with _state_lock:
+        page_skip_reason_counts[reason] += 1
 
 
 def _has_acceptable_size(page_bytes):
@@ -246,78 +433,207 @@ def _is_in_allowed_domains(hostname):
 
 
 def _has_disallowed_extension(path):
-    return bool(
-        re.match(
-            r".*\.(css|js|bmp|gif|jpe?g|ico"
-            r"|png|tiff?|mid|mp2|mp3|mp4"
-            r"|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
-            r"|ps|eps|tex|ppt|pptx|doc|docx|xls|xlsx|names"
-            r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
-            r"|epub|dll|cnf|tgz|sha1"
-            r"|thmx|mso|arff|rtf|jar|csv"
-            r"|rm|smil|wmv|swf|wma|zip|rar|gz)$",
-            path.lower(),
-        )
-    )
+    return bool(DISALLOWED_EXTENSION_RE.match(path.lower()))
+
+
+def _has_skip_path_token(path):
+    path_lower = path.lower()
+    return any(token in path_lower for token in SKIP_PATH_TOKENS)
 
 
 def _has_too_many_path_segments(path):
-    segments = [segment for segment in path.split("/") if segment]
+    segments = [s for s in path.split("/") if s]
     return len(segments) > MAX_PATH_SEGMENTS
 
 
 def _has_repeated_path_segments(path):
-    segments = [segment for segment in path.split("/") if segment]
+    segments = [s for s in path.split("/") if s]
     if not segments:
         return False
-    segment_counts = Counter(segments)
-    return max(segment_counts.values()) > MAX_PATH_SEGMENT_REPEATS
+    return max(Counter(segments).values()) > MAX_PATH_SEGMENT_REPEATS
 
 
-def _looks_like_calendar_trap(parsed_url):
-    # Many academic event pages link to neighboring days indefinitely.
-    path = parsed_url.path
-    query = parsed_url.query.lower()
-    if re.search(r"/\d{4}-\d{2}-\d{2}(/|$)", path):
-        return True
-    if re.search(r"/\d{4}/\d{1,2}/\d{1,2}(/|$)", path):
-        return True
-    if re.search(r"\b(year|month|day|date|when)=\d", query):
-        return True
+def _has_adjacent_repeated_segments(path):
+    # Catches /a/b/a/b/, /a/b/c/a/b/c/, ... where a doubling trap is forming.
+    # Window starts at 2 to avoid false positives on /cs/cs101/ style paths.
+    segments = [s for s in path.split("/") if s]
+    n = len(segments)
+    for start in range(n):
+        max_window = (n - start) // 2
+        for window in range(2, max_window + 1):
+            left = segments[start:start + window]
+            right = segments[start + window:start + 2 * window]
+            if left == right:
+                return True
     return False
 
 
-def record_page_analytics(page_url, soup):
-    global _pages_since_last_save
+def _is_calendar_trap(parsed):
+    path = parsed.path
+    for pattern in CALENDAR_PATH_PATTERNS:
+        if pattern.search(path):
+            return True
+    return _query_has_any_key(parsed.query, CALENDAR_QUERY_KEYS)
 
-    defragmented_url, _fragment = urldefrag(page_url)
-    if not defragmented_url or defragmented_url in analytics["unique_urls"]:
+
+def _has_duplicate_view_query(query):
+    return _query_has_any_key(query, DUPLICATE_VIEW_QUERY_KEYS)
+
+
+def _query_has_any_key(query, key_set):
+    if not query:
+        return False
+    for pair in query.lower().split("&"):
+        if not pair:
+            continue
+        key = pair.split("=", 1)[0]
+        if key in key_set:
+            return True
+    return False
+
+
+def _has_too_many_query_params(query):
+    if not query:
+        return False
+    return len([p for p in query.split("&") if p]) > MAX_QUERY_PARAMS
+
+
+def _has_runaway_pagination(query):
+    if not query:
+        return False
+    for pair in query.split("&"):
+        if "=" not in pair:
+            continue
+        key, _, value = pair.partition("=")
+        if key.lower() in ("page", "paged", "start", "offset"):
+            try:
+                if int(value) > MAX_PAGED_VALUE:
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def _is_git_view(path):
+    return any(pattern.search(path) for pattern in GIT_VIEW_PATTERNS)
+
+
+def record_page_analytics(page_url, soup):
+    global _pages_since_last_save, _pages_since_last_summary
+
+    canonical = canonicalize_url(page_url)
+    if not canonical:
         return
-    analytics["unique_urls"].add(defragmented_url)
+    # Cheap pre-check outside the lock; the authoritative dedup happens
+    # again inside the critical section below.
+    if canonical in analytics["unique_urls"]:
+        return
 
     page_text = soup.get_text(separator=" ")
     page_words = tokenize(page_text)
+    hostname = (urlparse(canonical).hostname or "").lower()
 
-    if len(page_words) > analytics["longest_page_word_count"]:
-        analytics["longest_page_word_count"] = len(page_words)
-        analytics["longest_page_url"] = defragmented_url
+    do_save = False
+    do_summary = False
+    host_cap_warning = None
+    with _state_lock:
+        if canonical in analytics["unique_urls"]:
+            return
+        analytics["unique_urls"].add(canonical)
 
-    for word in page_words:
-        if word not in STOP_WORDS:
-            analytics["word_counts"][word] += 1
+        if len(page_words) > analytics["longest_page_word_count"]:
+            analytics["longest_page_word_count"] = len(page_words)
+            analytics["longest_page_url"] = canonical
 
-    hostname = (urlparse(defragmented_url).hostname or "").lower()
-    if hostname == "uci.edu" or hostname.endswith(".uci.edu"):
-        analytics["subdomain_pages"][hostname].add(defragmented_url)
+        for word in page_words:
+            if word not in STOP_WORDS:
+                analytics["word_counts"][word] += 1
 
-    _pages_since_last_save += 1
-    if _pages_since_last_save >= SAVE_EVERY_N_PAGES:
+        if hostname == "uci.edu" or hostname.endswith(".uci.edu"):
+            analytics["subdomain_pages"][hostname].add(canonical)
+            host_count = len(analytics["subdomain_pages"][hostname])
+            if host_count and host_count % SOFT_HOST_PAGE_CAP == 0:
+                host_cap_warning = (hostname, host_count)
+
+        _pages_since_last_save += 1
+        _pages_since_last_summary += 1
+        if _pages_since_last_save >= SAVE_EVERY_N_PAGES:
+            do_save = True
+            _pages_since_last_save = 0
+        if _pages_since_last_summary >= SUMMARY_EVERY_N_PAGES:
+            do_summary = True
+            _pages_since_last_summary = 0
+
+    if host_cap_warning:
+        hostname, host_count = host_cap_warning
+        logger.warning(
+            f"host_page_cap_hit host={hostname} pages={host_count} "
+            "(check HOT_PREFIXES below for trap candidates)"
+        )
+    if do_save:
         save_analytics()
-        _pages_since_last_save = 0
+    if do_summary:
+        log_summary()
 
 
 def tokenize(text):
-    return [match.lower() for match in re.findall(r"[a-zA-Z]+", text)]
+    # Keeps contractions like "don't" together so they match stop_words.txt.
+    return [
+        match.lower()
+        for match in re.findall(r"[a-zA-Z]+(?:'[a-zA-Z]+)?", text)
+    ]
+
+
+# ============================================================
+# Periodic summary logging — single source of truth for monitoring.
+# ============================================================
+
+def log_summary():
+    # Snapshot everything we need under the lock so concurrent writers can't
+    # mutate the dicts mid-iteration. logger.info() then runs lock-free.
+    with _state_lock:
+        unique = len(analytics["unique_urls"])
+        longest_words = analytics["longest_page_word_count"]
+        longest_short = analytics["longest_page_url"][:80]
+        top_hosts = sorted(
+            ((h, len(u)) for h, u in analytics["subdomain_pages"].items()),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )[:8]
+        top_filter_reasons = filter_reason_counts.most_common(10)
+        top_page_skips = page_skip_reason_counts.most_common(6)
+        urls_snapshot = list(analytics["unique_urls"])
+
+    hosts_str = ", ".join(f"{h}={n}" for h, n in top_hosts) or "(none)"
+    logger.info(
+        f"SUMMARY unique={unique} longest={longest_words}w@{longest_short} "
+        f"top_hosts=[{hosts_str}]"
+    )
+    if top_filter_reasons:
+        reasons = ", ".join(f"{r}={c}" for r, c in top_filter_reasons)
+        logger.info(f"FILTER_REASONS {reasons}")
+    if top_page_skips:
+        skips = ", ".join(f"{r}={c}" for r, c in top_page_skips)
+        logger.info(f"PAGE_SKIPS {skips}")
+
+    hot_prefixes = _top_path_prefixes(urls_snapshot)
+    if hot_prefixes:
+        prefixes_str = ", ".join(f"{p}={n}" for p, n in hot_prefixes)
+        logger.info(f"HOT_PREFIXES {prefixes_str}")
+
+
+def _top_path_prefixes(urls, top_n=6, depth=3):
+    counts = Counter()
+    for u in urls:
+        try:
+            parsed = urlparse(u)
+        except (TypeError, ValueError):
+            continue
+        host = parsed.netloc
+        segs = [s for s in parsed.path.split("/") if s][:depth]
+        prefix = f"{host}/{'/'.join(segs)}" if segs else host
+        counts[prefix] += 1
+    return counts.most_common(top_n)
 
 
 # Allow `python3 scraper.py` to generate the report from saved analytics.
