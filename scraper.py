@@ -1,5 +1,6 @@
 import atexit
 import hashlib
+import io
 import json
 import os
 import re
@@ -58,6 +59,15 @@ PATH_HIT_LIMIT = 10
 # its outbound links.
 MIN_TEXT_DENSITY = 0.05
 
+# Rule E: after tokenization, pages with fewer than this many "meaningful"
+# tokens (alphanumeric runs of length >= 2 from the HW1 tokenizer) are thin
+# caption/list pages — not enough prose to justify crawling their out-links.
+MIN_CONTENT_TOKENS = 20
+
+# Minimum token length when counting words for the report (longest page,
+# word frequencies). Single-character runs are not English words.
+MIN_TOKEN_LEN_FOR_ANALYTICS = 2
+
 # Persisted state and report file locations (relative to project root).
 STOP_WORDS_FILE = "stop_words.txt"
 ANALYTICS_FILE = "analytics.json"
@@ -79,6 +89,36 @@ def load_stop_words(path):
 
 
 STOP_WORDS = load_stop_words(STOP_WORDS_FILE)
+
+
+# --- Tokenizer: same algorithm as vishokl_hw1/PartA.py (Assignment 1); reads the
+# string in 4096-char chunks via StringIO instead of a file path. @vishokl_hw1
+def tokenize(text):
+    tokens = []
+    current = []
+
+    f = io.StringIO(text)
+    while True:
+        chunk = f.read(4096)
+        if not chunk:
+            break
+        for char in chunk:
+            if char.isascii() and char.isalnum():
+                current.append(char.lower())
+            else:
+                if len(current) > 0:
+                    tokens.append("".join(current))
+                    current = []
+
+    if len(current) > 0:
+        tokens.append("".join(current))
+
+    return tokens
+
+
+def _meaningful_tokens_from_text(text):
+    # For word-count / longest-page report stats: drop 1-character "words".
+    return [t for t in tokenize(text) if len(t) >= MIN_TOKEN_LEN_FOR_ANALYTICS]
 
 
 # ============================================================
@@ -212,10 +252,14 @@ def extract_next_links(url, resp):
     # Rule C: pages with very little visible text relative to their HTML
     # payload are UI / navigation pages, not content. Rule D: pages whose
     # normalized text matches a previously-seen page are exact duplicates.
+    # Rule E: pages with too few meaningful words are thin caption/list pages.
     # In either case we still want to count the URL as visited (so the
     # unique-page count reflects reality), but we should not propagate the
     # outbound links — that's what fuels combinatorial traps.
     is_content_bearing = _has_sufficient_text_density(page_text, page_bytes)
+    meaningful_word_tokens = _meaningful_tokens_from_text(page_text)
+    if is_content_bearing and len(meaningful_word_tokens) < MIN_CONTENT_TOKENS:
+        is_content_bearing = False
     if is_content_bearing:
         content_hash = _content_fingerprint(page_text)
         if content_hash in analytics["content_hashes"]:
@@ -223,7 +267,7 @@ def extract_next_links(url, resp):
         else:
             analytics["content_hashes"].add(content_hash)
 
-    record_page_analytics(base_url, page_text, is_content_bearing)
+    record_page_analytics(base_url, meaningful_word_tokens, is_content_bearing)
 
     if not is_content_bearing:
         return []
@@ -274,6 +318,9 @@ def is_valid(url):
         if not _is_in_allowed_domains(hostname):
             return False
 
+        if _looks_like_tilde_photo_gallery(hostname, parsed_url.path):
+            return False
+
         if _has_disallowed_extension(parsed_url.path):
             return False
 
@@ -308,12 +355,43 @@ def is_valid(url):
 # Helper functions
 # ============================================================
 
+
+def _response_content_type_is_html(raw_response):
+    # Only treat body as HTML when the server says so. Stops .ppsx, PDFs,
+    # octet-stream binaries, etc. from polluting BeautifulSoup and word stats.
+    headers = getattr(raw_response, "headers", None)
+    if headers is None:
+        return True
+    content_type = ""
+    if hasattr(headers, "get"):
+        content_type = headers.get("Content-Type") or headers.get("content-type") or ""
+    main = str(content_type).split(";")[0].strip().lower()
+    if not main:
+        return True
+    return main in ("text/html", "application/xhtml+xml")
+
+
+def _looks_like_tilde_photo_gallery(hostname, path):
+    # Personal sites often expose thousands of near-identical photo-caption
+    # HTML pages under /~user/pix/... — low marginal value for textual IR.
+    hostname = (hostname or "").lower()
+    path_lower = path.lower()
+    if not any(
+        hostname == domain or hostname.endswith("." + domain)
+        for domain in ALLOWED_DOMAINS
+    ):
+        return False
+    return bool(re.match(r"/~[^/]+/pix(/|$)", path_lower))
+
+
 def _is_successful_response(resp):
     if resp.status != 200:
         return False
     if resp.raw_response is None:
         return False
     if not resp.raw_response.content:
+        return False
+    if not _response_content_type_is_html(resp.raw_response):
         return False
     return True
 
@@ -337,10 +415,15 @@ def _has_disallowed_extension(path):
             r".*\.(css|js|bmp|gif|jpe?g|ico"
             r"|png|tiff?|mid|mp2|mp3|mp4"
             r"|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
-            r"|ps|eps|tex|ppt|pptx|doc|docx|xls|xlsx|names"
+            r"|ps|eps|tex|ppt|pptx|pps|ppsx|ppsm|pptm"
+            r"|doc|docx|xls|xlsx|xlsm|names"
             r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
             r"|epub|dll|cnf|tgz|sha1"
             r"|thmx|mso|arff|rtf|jar|war|ear|apk|csv"
+            r"|sql|sqlite|odb|accdb|mdb"
+            r"|odp|ods|odt|odg"
+            r"|key|pages|numbers"
+            r"|ipynb|nb|wasm|ipa|pkg|deb|rpm|xz|lzma|zst"
             r"|rm|smil|wmv|swf|wma|zip|rar|gz)$",
             path.lower(),
         )
@@ -460,7 +543,7 @@ def _content_fingerprint(page_text):
     return hashlib.md5(normalized_text.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def record_page_analytics(page_url, page_text, is_content_bearing):
+def record_page_analytics(page_url, meaningful_word_tokens, is_content_bearing):
     global _pages_since_last_save
 
     defragmented_url, _fragment = urldefrag(page_url)
@@ -486,11 +569,10 @@ def record_page_analytics(page_url, page_text, is_content_bearing):
     # analytics. UI / duplicate pages would otherwise drown the report in
     # boilerplate words ("edit", "preview", "namespace", "history", ...).
     if is_content_bearing and is_new_url:
-        page_words = tokenize(page_text)
-        if len(page_words) > analytics["longest_page_word_count"]:
-            analytics["longest_page_word_count"] = len(page_words)
+        if len(meaningful_word_tokens) > analytics["longest_page_word_count"]:
+            analytics["longest_page_word_count"] = len(meaningful_word_tokens)
             analytics["longest_page_url"] = defragmented_url
-        for word in page_words:
+        for word in meaningful_word_tokens:
             if word not in STOP_WORDS:
                 analytics["word_counts"][word] += 1
 
@@ -498,10 +580,6 @@ def record_page_analytics(page_url, page_text, is_content_bearing):
     if _pages_since_last_save >= SAVE_EVERY_N_PAGES:
         save_analytics()
         _pages_since_last_save = 0
-
-
-def tokenize(text):
-    return [match.lower() for match in re.findall(r"[a-zA-Z]+", text)]
 
 
 # Allow `python3 scraper.py` to generate the report from saved analytics.
