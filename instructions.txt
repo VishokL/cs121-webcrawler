@@ -14,7 +14,7 @@ As a concrete deliverable of this project, besides the code itself, you must sub
 
 How many unique pages did you find? Uniqueness for the purposes of this assignment is ONLY established by the URL, but discarding the fragment part. So, for example, http://www.ics.uci.edu#aaa and http://www.ics.uci.edu#bbb are the same URL. Even if you implement additional methods for textual similarity detection, please keep considering the above definition of unique pages for the purposes of counting the unique pages in this assignment.
 What is the longest page in terms of the number of words? (HTML markup doesn’t count as words)
-What are the 50 most common words in the entire set of pages crawled under these domains ? (Ignore English stop words, which can be found, for example, here Links to an external site.) Submit the list of common words ordered by frequency.
+What are the 50 most common words in the entire set of pages crawled under these domains ? (Ignore English stop words, which can be found at stop_words.txt) Submit the list of common words ordered by frequency.
 How many subdomains did you find in the uci.edu domain? Submit the list of subdomains ordered alphabetically and the number of unique pages detected in each subdomain. The content of this list should be lines containing subdomain, number, for example:
 vision.ics.uci.edu, 10 (not the actual number here)
 What to submit: a zip file containing your modified crawler code and the report.
@@ -33,7 +33,7 @@ Make sure to return only URLs that are within the domains and paths mentioned ab
 Make sure to defragment the URLs, i.e. remove the fragment part.
 You can use whatever libraries make your life easier to parse things. Optional dependencies you might want to look at: BeautifulSoup, lxml (nudge, nudge, wink, wink!)
 Optionally, in the scraper function, you can also save the URL and the web page on your local disk.
-See Crawler Details
+See Crawler Details (crawler_details.txt)
 Run the crawler from your laptop/desktop or from an ICS openlab machine ( you can use either the classical ssh&scp to openlab.ics.uci.edu or you can use the web interface hub.ics.uci.edu from your browser; I would recommend you to use ssh, such that you will learn a skill that will be probably important for the rest of your professional life... note that to install any software in machines that you do not own or that you are authorized to sudo, you need to install them to your user folder, and in pip/pip3 you need to use the --user option to do so ). Note that this will take several hours, possibly a day! It may even never end if you are not careful with your implementation! Note that you need to be inside the campus network, or you won't be able to crawl. If your computer is outside UCI, use the VPN.
 Monitor what your crawler is doing. If you see it trapped in a Web trap, or malfunctioning in any way, stop it, fix the problem in the code, and restart it. Sometimes, you may need to restart from scratch. In that case, delete the frontier file (frontier.shelve), or move it to a backup location, before restarting the crawler.
 Crawler Behavior Requirements
