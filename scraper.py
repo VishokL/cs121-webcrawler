@@ -241,11 +241,18 @@ def extract_next_links(url, resp):
         href_value = anchor_tag["href"].strip()
         if not href_value:
             continue
-        absolute_url = urljoin(base_url, href_value)
-        defragmented_url, _fragment = urldefrag(absolute_url)
-        if not defragmented_url:
+        # Some pages contain malformed anchors (e.g. href="http://[YOUR_IP]:8080/..."
+        # placeholder text in tutorials). Python 3.10's urlparse validates
+        # bracketed netlocs as IPv6 addresses and raises ValueError on text
+        # like "YOUR_IP", which would otherwise kill the worker thread.
+        try:
+            absolute_url = urljoin(base_url, href_value)
+            defragmented_url, _fragment = urldefrag(absolute_url)
+            if not defragmented_url:
+                continue
+            parsed_target = urlparse(defragmented_url)
+        except ValueError:
             continue
-        parsed_target = urlparse(defragmented_url)
         target_path_key = (parsed_target.netloc, parsed_target.path)
         if target_path_key in seen_target_path_keys:
             continue
@@ -290,6 +297,11 @@ def is_valid(url):
     except TypeError:
         print("TypeError for ", parsed_url)
         raise
+    except ValueError:
+        # Python 3.10's urlparse raises ValueError on URLs with malformed
+        # bracketed netlocs such as http://[YOUR_IP]:8080/... Treat them as
+        # uncrawlable rather than letting the exception propagate.
+        return False
 
 
 # ============================================================
@@ -328,7 +340,7 @@ def _has_disallowed_extension(path):
             r"|ps|eps|tex|ppt|pptx|doc|docx|xls|xlsx|names"
             r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
             r"|epub|dll|cnf|tgz|sha1"
-            r"|thmx|mso|arff|rtf|jar|csv"
+            r"|thmx|mso|arff|rtf|jar|war|ear|apk|csv"
             r"|rm|smil|wmv|swf|wma|zip|rar|gz)$",
             path.lower(),
         )
