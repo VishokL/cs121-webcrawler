@@ -47,7 +47,10 @@ MAX_QUERY_PARAMS = 3
 # Rule A: once we have crawled this many distinct query-string variants of a
 # single (host, path), assume any further variant is part of a combinatorial
 # trap (DokuWiki media manager, calendar pickers, faceted search, etc.).
-PATH_HIT_LIMIT = 25
+# Legitimate UCI content pages rarely produce more than a handful of distinct
+# query-string variants of the same path, so 10 leaves comfortable headroom
+# while cutting off combinatorial traps quickly.
+PATH_HIT_LIMIT = 10
 
 # Rule C: ratio of visible-text bytes to total HTML bytes below which a page
 # is treated as low-information (UI / navigation chrome rather than content).
@@ -225,15 +228,29 @@ def extract_next_links(url, resp):
     if not is_content_bearing:
         return []
 
+    # Per-page same-(host, path) dedupe: from any single source page we emit
+    # at most one URL per (host, path). If a page links to 50 query-string
+    # variants of /doku.php/foo, we keep only the first — the others are by
+    # definition alternate views of the same underlying page (Lecture 7
+    # slide 40's "ever changing URLs" trap signature). This works in concert
+    # with Rule A to cap a trap path's hit count near PATH_HIT_LIMIT instead
+    # of (N source pages) × (~50 variants each).
     extracted_links = []
+    seen_target_path_keys = set()
     for anchor_tag in soup.find_all("a", href=True):
         href_value = anchor_tag["href"].strip()
         if not href_value:
             continue
         absolute_url = urljoin(base_url, href_value)
         defragmented_url, _fragment = urldefrag(absolute_url)
-        if defragmented_url:
-            extracted_links.append(defragmented_url)
+        if not defragmented_url:
+            continue
+        parsed_target = urlparse(defragmented_url)
+        target_path_key = (parsed_target.netloc, parsed_target.path)
+        if target_path_key in seen_target_path_keys:
+            continue
+        seen_target_path_keys.add(target_path_key)
+        extracted_links.append(defragmented_url)
 
     return extracted_links
 
@@ -260,6 +277,8 @@ def is_valid(url):
         if _has_repeated_path_segments(parsed_url.path):
             return False
         if _looks_like_calendar_trap(parsed_url):
+            return False
+        if _is_non_html_export_query(parsed_url.query):
             return False
         if _has_too_many_query_params(parsed_url.query):
             return False
@@ -330,16 +349,60 @@ def _has_repeated_path_segments(path):
 
 
 def _looks_like_calendar_trap(parsed_url):
-    # Many academic event pages link to neighboring days indefinitely.
+    # Per CS121 Discussion 3 ("Keep Your Crawler Away From: Calendars, things
+    # that end with a date, things that end with events-week..."), this
+    # function looks for URL shapes that are almost always calendar/event
+    # navigation UIs rather than content. Each branch is a distinct shape
+    # we've seen or that the discussion called out.
     path = parsed_url.path
     query = parsed_url.query.lower()
+
+    # Full ISO-style dates as path components: /2024-01-15/... or .../2024-01-15
     if re.search(r"/\d{4}-\d{2}-\d{2}(/|$)", path):
         return True
+    # Slash-separated dates as path components: /2024/01/15/... or .../2024/1/15
     if re.search(r"/\d{4}/\d{1,2}/\d{1,2}(/|$)", path):
         return True
-    if re.search(r"\b(year|month|day|date|when)=\d", query):
+    # Year-only or year-month archive paths (WordPress-style /2024/, /2024/01/).
+    # The (/|$) anchor on the right keeps this from matching legitimate segments
+    # like /research/2019-project-report/ where the year is embedded in text.
+    if re.search(r"/(19|20)\d{2}(/\d{1,2})?(/|$)", path):
         return True
+    # Event/calendar UI navigation pages: /events/week/..., /calendar/month/...
+    if re.search(r"/(events?|calendar)/(week|day|month|year)\b", path):
+        return True
+
+    # Date-style query keys typically used to page through calendar views.
+    if re.search(
+        r"\b(year|month|day|date|when|eventdate|startdate|enddate|from|to|after|before)=\d",
+        query,
+    ):
+        return True
+
     return False
+
+
+def _is_non_html_export_query(query):
+    # Reject URLs whose query string asks for a non-HTML representation of an
+    # already-crawled page (DokuWiki ?do=export_pdf / export_xhtml, MediaWiki
+    # ?action=raw / ?action=edit, generic ?format=pdf|xml|json, etc.).
+    # These responses are either binary (PDF) — which causes BeautifulSoup to
+    # emit "REPLACEMENT CHARACTER" decoding warnings — or non-content UI
+    # views, and they never contribute new information beyond the canonical
+    # page already in scope.
+    if not query:
+        return False
+    return bool(
+        re.search(
+            r"\b("
+            r"do=export_"
+            r"|action=(raw|edit|history|info|delete|protect|purge)"
+            r"|format=(pdf|xml|json|atom|rss|raw|csv)"
+            r"|output=(pdf|xml|json|raw)"
+            r")",
+            query.lower(),
+        )
+    )
 
 
 def _has_too_many_query_params(query):
