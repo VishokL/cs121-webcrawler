@@ -226,6 +226,12 @@ def extract_next_links(url, resp):
     except Exception:
         return []
 
+    # Strip <script> and <style> bodies before extracting text. By default
+    # get_text() includes their contents, which leaks JS and CSS rules
+    # (e.g. "padding: 5px", "color: #fff") into the word counts.
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
     page_text = soup.get_text(separator=" ")
 
     # Rule C: pages with very little visible text relative to their HTML
@@ -254,6 +260,14 @@ def extract_next_links(url, resp):
     # slide 40's "ever changing URLs" trap signature). This works in concert
     # with Rule A to cap a trap path's hit count near PATH_HIT_LIMIT instead
     # of (N source pages) × (~50 variants each).
+    # Per-source-page same-dir cap applies only to *sequential* filenames
+    # (nodeN.html, slideN.html). For these, a single index page can list
+    # 100+ sibling URLs and would otherwise stuff all of them into the
+    # frontier before seq_dir_hits can refuse any. Non-sequential URLs
+    # (word slugs like "towards-weaving-the-visual-web") are uncapped —
+    # legitimate listing pages on faculty / news / pubs directories link
+    # to many real sibling pages, and capping those at 5 starved the
+    # crawl down to 3,638 pages.
     extracted_links = []
     seen_target_path_keys = set()
     target_dir_counts = Counter()
@@ -278,11 +292,12 @@ def extract_next_links(url, resp):
             continue
         seen_target_path_keys.add(target_path_key)
 
-        target_hostname = (parsed_target.hostname or "").lower()
-        target_dir_key = _dir_key(target_hostname, parsed_target.path)
-        if target_dir_counts[target_dir_key] >= MAX_SAME_DIR_PER_PAGE:
-            continue
-        target_dir_counts[target_dir_key] += 1
+        if _is_sequential_filename(parsed_target.path):
+            target_hostname = (parsed_target.hostname or "").lower()
+            target_dir_key = _dir_key(target_hostname, parsed_target.path)
+            if target_dir_counts[target_dir_key] >= MAX_SAME_DIR_PER_PAGE:
+                continue
+            target_dir_counts[target_dir_key] += 1
 
         extracted_links.append(defragmented_url)
 
@@ -305,6 +320,9 @@ def is_valid(url):
             return False
 
         if _is_pagination_archive(parsed_url.path):
+            return False
+
+        if _is_low_info_path(parsed_url.path):
             return False
 
         if len(url) > MAX_URL_LENGTH:
@@ -380,6 +398,9 @@ def _has_disallowed_extension(path):
             r"|doc|docx|docm|xls|xlsx|xlsm|names"
             r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
             r"|epub|dll|cnf|tgz|sha1|ipynb|nb"
+            r"|txt|md|log|yaml|yml|conf|cfg|ini|sql"
+            r"|c|cc|cpp|cxx|h|hpp|hxx|java|py|rb|pl|go|rs|swift|kt"
+            r"|ff|bib|sty|bst|cls"
             r"|thmx|mso|arff|rtf|jar|war|ear|apk|csv"
             r"|rm|smil|wmv|swf|wma|zip|rar|gz)$",
             path.lower(),
@@ -453,6 +474,31 @@ def _is_non_html_export_query(query):
             r"|output=(pdf|xml|json|raw)"
             r")",
             query.lower(),
+        )
+    )
+
+
+def _is_low_info_path(path):
+    # Path patterns that consistently produce "sets of similar pages with no
+    # information" (assignment criterion) or non-HTML downloads served at
+    # extension-less URLs. Each pattern is justified by an observed crawl:
+    #
+    #   pix/photos/gallery/albums  — faculty photo galleries (eppstein/pix/*);
+    #     top 50 words were dominated by EXIF (mm, iso, canon, eos, crw).
+    #   genealogy/family-tree/ancestry/surnames  — genealogy databases
+    #     (~dhirschb/genealogy/Krakow); top 50 words were dominated by
+    #     months (jan, feb, ...) and family-record fields (married, krakow,
+    #     podgorze, abraham, manhattan).
+    #   zip-attachment/raw-attachment  — Trac wiki download views; the URL
+    #     has no file extension but the response body is binary (zip/pdf)
+    #     and was the source of the 65,578-word "longest page".
+    return bool(
+        re.search(
+            r"/(pix|photos?|gallery|galleries|albums?"
+            r"|genealogy|family[-_]?tree|ancestry|surnames?"
+            r"|zip[-_]?attachment|raw[-_]?attachment)(/|$)",
+            path,
+            re.IGNORECASE,
         )
     )
 
