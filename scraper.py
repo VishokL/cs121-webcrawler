@@ -1,5 +1,7 @@
 import atexit
+import calendar
 import hashlib
+import io
 import json
 import os
 import re
@@ -78,6 +80,27 @@ _SEQUENTIAL_FILENAME_RE = re.compile(
 # its outbound links.
 MIN_TEXT_DENSITY = 0.05
 
+# Rule F: pages with fewer than this many *report-eligible* words (see
+# _meaningful_tokens_from_text) are thin — count the URL as visited but
+# don't propagate out-links. Catches photo captions, short listings, and
+# placeholder pages that slip past the byte-size and text-density rules.
+MIN_CONTENT_TOKENS = 18
+
+# For Q2/Q3 only (after HW1 tokenize): English-ish tokens, not citation noise.
+# - Letters only: drops "18", "5x", "3o", etc.
+# - Minimum length 3: drops "ny", two-letter state codes, single doubled chars.
+MIN_REPORT_WORD_LEN = 3
+
+# Month names/abbrevs appear on almost every dated page; they dominated Q3
+# during early test crawls. Built from the stdlib calendar tables
+# (locale-independent English) rather than hand-maintaining strings. "sept"
+# is a common written form; month_abbr only exposes "sep".
+REPORT_MONTH_STOPWORDS = (
+    frozenset(calendar.month_abbr[i].lower() for i in range(1, 13))
+    | frozenset(calendar.month_name[i].lower() for i in range(1, 13))
+    | frozenset({"sept"})
+)
+
 # Persisted state and report file locations (relative to project root).
 STOP_WORDS_FILE = "stop_words.txt"
 ANALYTICS_FILE = "analytics.json"
@@ -99,6 +122,51 @@ def load_stop_words(path):
 
 
 STOP_WORDS = load_stop_words(STOP_WORDS_FILE)
+
+
+# ============================================================
+# Tokenization
+# ============================================================
+
+# Same algorithm as hw1/PartA.py (Assignment 1)
+def tokenize(text):
+    tokens = []
+    current = []
+
+    f = io.StringIO(text)
+    while True:
+        chunk = f.read(4096)
+        if not chunk:
+            break
+        for char in chunk:
+            if char.isascii() and char.isalnum():
+                current.append(char.lower())
+            else:
+                if len(current) > 0:
+                    tokens.append("".join(current))
+                    current = []
+
+    if len(current) > 0:
+        tokens.append("".join(current))
+
+    return tokens
+
+
+def _meaningful_tokens_from_text(text):
+    # HW1 tokenize(), then Q2/Q3 filters. The assignment only requires the
+    # stop_words.txt filter, but additionally dropping pure-digit and mixed
+    # alphanumeric citation noise ("18", "5x", "p3") and month names keeps
+    # the top-50 list from being dominated by calendar/reference junk.
+    eligible = []
+    for token in tokenize(text):
+        if len(token) < MIN_REPORT_WORD_LEN:
+            continue
+        if not token.isalpha():
+            continue
+        if token in REPORT_MONTH_STOPWORDS:
+            continue
+        eligible.append(token)
+    return eligible
 
 
 # ============================================================
@@ -244,10 +312,14 @@ def extract_next_links(url, resp):
     # Rule C: pages with very little visible text relative to their HTML
     # payload are UI / navigation pages, not content. Rule D: pages whose
     # normalized text matches a previously-seen page are exact duplicates.
-    # In either case we still want to count the URL as visited (so the
-    # unique-page count reflects reality), but we should not propagate the
+    # Rule F: pages with too few meaningful word tokens are thin
+    # caption/listing pages. In every case we still count the URL as visited
+    # (so the unique-page count reflects reality), but we don't propagate
     # outbound links — that's what fuels combinatorial traps.
     is_content_bearing = _has_sufficient_text_density(page_text, page_bytes)
+    meaningful_word_tokens = _meaningful_tokens_from_text(page_text)
+    if is_content_bearing and len(meaningful_word_tokens) < MIN_CONTENT_TOKENS:
+        is_content_bearing = False
     if is_content_bearing:
         content_hash = _content_fingerprint(page_text)
         if content_hash in analytics["content_hashes"]:
@@ -255,7 +327,7 @@ def extract_next_links(url, resp):
         else:
             analytics["content_hashes"].add(content_hash)
 
-    record_page_analytics(base_url, page_text, is_content_bearing)
+    record_page_analytics(base_url, meaningful_word_tokens, is_content_bearing)
 
     if not is_content_bearing:
         return []
@@ -369,7 +441,25 @@ def _is_successful_response(resp):
         return False
     if not resp.raw_response.content:
         return False
+    if not _response_content_type_is_html(resp.raw_response):
+        return False
     return True
+
+
+def _response_content_type_is_html(raw_response):
+    # Only treat the body as HTML when the server says so. Stops .ppsx, PDFs,
+    # octet-stream binaries, etc. from polluting BeautifulSoup and word stats
+    # when they're served at extension-less URLs that slip past the regex.
+    headers = getattr(raw_response, "headers", None)
+    if headers is None:
+        return True
+    content_type = ""
+    if hasattr(headers, "get"):
+        content_type = headers.get("Content-Type") or headers.get("content-type") or ""
+    main = str(content_type).split(";")[0].strip().lower()
+    if not main:
+        return True
+    return main in ("text/html", "application/xhtml+xml")
 
 
 def _has_acceptable_size(page_bytes):
@@ -395,10 +485,13 @@ def _has_disallowed_extension(path):
             r"|doc|docx|docm|xls|xlsx|xlsm|names"
             r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
             r"|epub|dll|cnf|tgz|sha1|ipynb|nb"
-            r"|txt|md|log|yaml|yml|conf|cfg|ini|sql"
+            r"|txt|md|log|yaml|yml|conf|cfg|ini"
+            r"|sql|sqlite|odb|accdb|mdb"
+            r"|odp|ods|odt|odg|key|pages|numbers"
             r"|c|cc|cpp|cxx|h|hpp|hxx|java|py|rb|pl|go|rs|swift|kt"
             r"|ff|bib|sty|bst|cls"
             r"|thmx|mso|arff|rtf|jar|war|ear|apk|csv"
+            r"|wasm|ipa|pkg|deb|rpm|xz|lzma|zst"
             r"|rm|smil|wmv|swf|wma|zip|rar|gz)$",
             path.lower(),
         )
@@ -571,7 +664,7 @@ def _content_fingerprint(page_text):
     return hashlib.md5(normalized_text.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def record_page_analytics(page_url, page_text, is_content_bearing):
+def record_page_analytics(page_url, meaningful_word_tokens, is_content_bearing):
     global _pages_since_last_save
 
     defragmented_url, _fragment = urldefrag(page_url)
@@ -595,11 +688,10 @@ def record_page_analytics(page_url, page_text, is_content_bearing):
     # analytics. UI / duplicate pages would otherwise drown the report in
     # boilerplate words ("edit", "preview", "namespace", "history", ...).
     if is_content_bearing and is_new_url:
-        page_words = tokenize(page_text)
-        if len(page_words) > analytics["longest_page_word_count"]:
-            analytics["longest_page_word_count"] = len(page_words)
+        if len(meaningful_word_tokens) > analytics["longest_page_word_count"]:
+            analytics["longest_page_word_count"] = len(meaningful_word_tokens)
             analytics["longest_page_url"] = defragmented_url
-        for word in page_words:
+        for word in meaningful_word_tokens:
             if word not in STOP_WORDS:
                 analytics["word_counts"][word] += 1
 
@@ -607,14 +699,6 @@ def record_page_analytics(page_url, page_text, is_content_bearing):
     if _pages_since_last_save >= SAVE_EVERY_N_PAGES:
         save_analytics()
         _pages_since_last_save = 0
-
-
-def tokenize(text):
-    # Require at least 2 characters: single-letter tokens ("a"/"I" or noise
-    # from binary-file decoding artifacts) contribute no useful information
-    # and would otherwise dominate the word counts if any non-HTML response
-    # slipped past the extension filters.
-    return [match.lower() for match in re.findall(r"[a-zA-Z]{2,}", text)]
 
 
 # Allow `python3 scraper.py` to generate the report from saved analytics.
