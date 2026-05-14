@@ -65,6 +65,13 @@ SEQUENTIAL_PAGE_LIMIT = 30
 # extraction call — long before the sequential counter could catch up.
 MAX_SAME_DIR_PER_PAGE = 5
 
+# Filenames that are purely numeric or a short word plus a number:
+# node118, slide42, page7, item3, 0042, etc. These are sequential indexing
+# patterns found in slide traps, not human-readable content slugs.
+_SEQUENTIAL_FILENAME_RE = re.compile(
+    r"^(?:[a-z]{0,10})?(\d+)(\.html?)?$", re.IGNORECASE
+)
+
 # Rule C: ratio of visible-text bytes to total HTML bytes below which a page
 # is treated as low-information (UI / navigation chrome rather than content).
 # When this is hit we still count the URL as visited but do not propagate
@@ -253,21 +260,14 @@ def extract_next_links(url, resp):
     if not is_content_bearing:
         return []
 
-    # Per-page same-(host, path) dedupe: from any single source page we emit
-    # at most one URL per (host, path). If a page links to 50 query-string
-    # variants of /doku.php/foo, we keep only the first — the others are by
-    # definition alternate views of the same underlying page (Lecture 7
-    # slide 40's "ever changing URLs" trap signature). This works in concert
-    # with Rule A to cap a trap path's hit count near PATH_HIT_LIMIT instead
-    # of (N source pages) × (~50 variants each).
-    # Per-source-page same-dir cap applies only to *sequential* filenames
-    # (nodeN.html, slideN.html). For these, a single index page can list
-    # 100+ sibling URLs and would otherwise stuff all of them into the
-    # frontier before seq_dir_hits can refuse any. Non-sequential URLs
-    # (word slugs like "towards-weaving-the-visual-web") are uncapped —
-    # legitimate listing pages on faculty / news / pubs directories link
-    # to many real sibling pages, and capping those at 5 starved the
-    # crawl down to 3,638 pages.
+    # Two per-source-page caps work together with the is_valid budgets:
+    #   1. seen_target_path_keys: emit at most one URL per (host, path), so
+    #      50 query-string variants of /doku.php/foo collapse to a single
+    #      link — the "ever changing URLs" trap signature from Lecture 7.
+    #   2. target_dir_counts: cap same-directory sequential-named URLs at
+    #      MAX_SAME_DIR_PER_PAGE per source. Non-sequential URLs (word
+    #      slugs) are not capped so legitimate listing pages (faculty
+    #      pubs, news, course indexes) keep their link breadth.
     extracted_links = []
     seen_target_path_keys = set()
     target_dir_counts = Counter()
@@ -351,13 +351,10 @@ def is_valid(url):
             analytics["path_hits"][_path_key(hostname, parsed_url.path)] += 1
         return True
 
-    except TypeError:
-        print("TypeError for ", parsed_url)
-        raise
-    except ValueError:
-        # Python 3.10's urlparse raises ValueError on URLs with malformed
-        # bracketed netlocs such as http://[YOUR_IP]:8080/... Treat them as
-        # uncrawlable rather than letting the exception propagate.
+    except (TypeError, ValueError):
+        # urlparse can raise TypeError if url is not a string and ValueError
+        # on malformed bracketed netlocs (e.g. http://[YOUR_IP]:8080/...).
+        # Either way, treat the URL as uncrawlable.
         return False
 
 
@@ -430,16 +427,13 @@ def _looks_like_calendar_trap(parsed_url):
     path = parsed_url.path
     query = parsed_url.query.lower()
 
-    # Full ISO-style dates as path components: /2024-01-15/... or .../2024-01-15
-    if re.search(r"/\d{4}-\d{2}-\d{2}(/|$)", path):
+    # Date archive pages — the date must be at the END of the path. Without
+    # the end-anchor, this also catches WordPress permalinks like
+    # /2024/03/some-post/ where the date is a prefix to real content, and
+    # silently drops those posts at is_valid.
+    if re.search(r"/\d{4}-\d{2}-\d{2}/?$", path):  # ISO date archive
         return True
-    # Slash-separated dates as path components: /2024/01/15/... or .../2024/1/15
-    if re.search(r"/\d{4}/\d{1,2}/\d{1,2}(/|$)", path):
-        return True
-    # Year-only or year-month archive paths (WordPress-style /2024/, /2024/01/).
-    # The (/|$) anchor on the right keeps this from matching legitimate segments
-    # like /research/2019-project-report/ where the year is embedded in text.
-    if re.search(r"/(19|20)\d{2}(/\d{1,2})?(/|$)", path):
+    if re.search(r"/(19|20)\d{2}(/\d{1,2}){0,2}/?$", path):  # /YYYY, /YYYY/MM, /YYYY/MM/DD
         return True
     # Event/calendar UI navigation pages: /events/week/..., /calendar/month/...
     if re.search(r"/(events?|calendar)/(week|day|month|year)\b", path):
@@ -544,14 +538,6 @@ def _dir_key(hostname, path):
     return f"{hostname}{dir_prefix}"
 
 
-# Matches filenames that are purely numeric or a short word plus a number:
-# node118, slide42, page7, item3, 0042, etc. These are sequential indexing
-# patterns found in slide traps, not human-readable content slugs.
-_SEQUENTIAL_FILENAME_RE = re.compile(
-    r"^(?:[a-z]{0,10})?(\d+)(\.html?)?$", re.IGNORECASE
-)
-
-
 def _is_sequential_filename(path):
     filename = path.rsplit("/", 1)[-1]
     return bool(_SEQUENTIAL_FILENAME_RE.match(filename))
@@ -624,10 +610,10 @@ def record_page_analytics(page_url, page_text, is_content_bearing):
 
 
 def tokenize(text):
-    # Require at least 2 characters: single-letter tokens are almost always
-    # noise (binary-file decoding artifacts, variable names from code blocks,
-    # or stop words like "a"/"I") and dominated the previous run's word
-    # counts when a .ppsx slipped through.
+    # Require at least 2 characters: single-letter tokens ("a"/"I" or noise
+    # from binary-file decoding artifacts) contribute no useful information
+    # and would otherwise dominate the word counts if any non-HTML response
+    # slipped past the extension filters.
     return [match.lower() for match in re.findall(r"[a-zA-Z]{2,}", text)]
 
 
