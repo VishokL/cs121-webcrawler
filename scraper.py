@@ -181,6 +181,7 @@ atexit.register(save_analytics)
 # Writes report answers to disk.
 def generate_report(path=REPORT_FILE):
     lines = []
+
     lines.append(f"1. Unique pages found: {len(analytics['unique_urls'])}\n\n")
     lines.append(f"2. Longest page (by word count): {analytics['longest_page_url']} ({analytics['longest_page_word_count']} words)\n\n")
 
@@ -346,7 +347,7 @@ def is_valid(url):
         return False
 
 
-< HELPER FUNCTIONS >
+# < HELPER FUNCTIONS >
 
 # Checks for usable HTTP 200 HTML response.
 def _is_successful_response(resp):
@@ -570,7 +571,7 @@ def record_page_analytics(page_url, meaningful_word_tokens, is_content_bearing):
         if len(meaningful_word_tokens) > analytics["longest_page_word_count"]:
             analytics["longest_page_word_count"] = len(meaningful_word_tokens)
             analytics["longest_page_url"] = defragmented_url
-            
+
         for word in meaningful_word_tokens:
             if word not in STOP_WORDS:
                 analytics["word_counts"][word] += 1
@@ -581,7 +582,6 @@ def record_page_analytics(page_url, meaningful_word_tokens, is_content_bearing):
         _pages_since_last_save = 0
 
 
-# Allow `python3 scraper.py` to generate the report from saved analytics.
 if __name__ == "__main__":
     generate_report()
     print(f"Report written to {REPORT_FILE}")
