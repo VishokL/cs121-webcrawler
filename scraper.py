@@ -1,12 +1,11 @@
 import atexit
-import calendar
 import hashlib
 import io
 import json
 import os
 import re
 from urllib.parse import urldefrag, urljoin, urlparse
-from collections import Counter, defaultdict
+from collections import Counter
 from bs4 import BeautifulSoup
 
 # < GLOBAL VARIABLES >
@@ -19,7 +18,8 @@ ALLOWED_DOMAINS = (
 )
 
 # Filters for exceedingly small/large files.
-MIN_PAGE_BYTES, MAX_PAGE_BYTES = 500, 5000000
+MIN_PAGE_BYTES = 500
+MAX_PAGE_BYTES = 5000000
 
 # Trap detection thresholds for is_valid.
 MAX_URL_LENGTH = 300
@@ -50,8 +50,33 @@ MIN_CONTENT_TOKENS = 18
 # Minimum token length for report's word counts.
 MIN_REPORT_WORD_LEN = 3
 
-# Month names/abbrevs to exclude from word counts.
-MONTH_STOPWORDS = frozenset(calendar.month_abbr[i].lower() for i in range(1, 13)) | frozenset(calendar.month_name[i].lower() for i in range(1, 13)) | frozenset({"sept"})
+# Month names/abbrevs to exclude from word counts (English).
+MONTH_STOPWORDS = {
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "may",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "sept",
+    "oct",
+    "nov",
+    "dec",
+    "january",
+    "february",
+    "march",
+    "april",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+}
 
 # Persisted state and report file locations.
 STOP_WORDS_FILE = "stop_words.txt"
@@ -60,7 +85,6 @@ REPORT_FILE = "report.txt"
 
 # Flushes analytics to disk every N pages.
 SAVE_INTERVAL = 25
-
 
 # < STOP WORDS >
 
@@ -71,7 +95,6 @@ def load_stop_words(path):
 
     with open(path, encoding="utf-8") as stop_words_file:
         return {line.strip().lower() for line in stop_words_file if line.strip()}
-
 
 # < TOKENIZATION >
 
@@ -115,7 +138,6 @@ def meaningful_tokens(text):
         eligible.append(token)
     return eligible
 
-
 # < ANALYTICS STATE >
 
 class Crawler:
@@ -126,9 +148,9 @@ class Crawler:
         self.longest_page_url = ""
         self.longest_word_count = 0
         self.word_counts = Counter()
-        self.subdomain_pages = defaultdict(set)
-        self.path_hits = defaultdict(int)
-        self.seq_dir_hits = defaultdict(int)
+        self.subdomain_pages = {}
+        self.path_hits = {}
+        self.seq_dir_hits = {}
         self.content_hashes = set()
         self.pages_since_save = 0
         self.load(analytics_file)
@@ -146,9 +168,11 @@ class Crawler:
         self.longest_page_url = saved_state.get("longest_page_url", "")
         self.longest_word_count = saved_state.get("longest_word_count", 0)
         self.word_counts = Counter(saved_state.get("word_counts", {}))
-        self.subdomain_pages = defaultdict(set, {hostname: set(urls) for hostname, urls in saved_state.get("subdomain_pages", {}).items()})
-        self.path_hits = defaultdict(int, saved_state.get("path_hits", {}))
-        self.seq_dir_hits = defaultdict(int, saved_state.get("seq_dir_hits", {}))
+        self.subdomain_pages = {
+            hostname: set(urls) for hostname, urls in saved_state.get("subdomain_pages", {}).items()
+        }
+        self.path_hits = dict(saved_state.get("path_hits", {}))
+        self.seq_dir_hits = dict(saved_state.get("seq_dir_hits", {}))
         self.content_hashes = set(saved_state.get("content_hashes", []))
 
     # Saves analytics state to disk.
@@ -200,6 +224,8 @@ class Crawler:
             self.unique_urls.add(clean_url)
 
             if hostname == "uci.edu" or hostname.endswith(".uci.edu"):
+                if hostname not in self.subdomain_pages:
+                    self.subdomain_pages[hostname] = set()
                 self.subdomain_pages[hostname].add(clean_url)
 
         if is_content and is_new:
@@ -216,17 +242,14 @@ class Crawler:
             self.save()
             self.pages_since_save = 0
 
-
 crawler = Crawler()
 atexit.register(crawler.save)
-
 
 # < STARTING CODE >
 
 def scraper(url, resp):
     links = extract_next_links(url, resp)
     return [link for link in links if is_valid(link)]
-
 
 def extract_next_links(url, resp):
     # Implementation required.
@@ -264,7 +287,7 @@ def extract_next_links(url, resp):
         is_content = False
 
     if is_content:
-        content_hash = fingerprint(page_text)
+        content_hash = hash_normalized_page_text(page_text)
         if content_hash in crawler.content_hashes:
             is_content = False
 
@@ -313,7 +336,6 @@ def extract_next_links(url, resp):
 
     return links
 
-
 def is_valid(url):
     # Decide whether to crawl this url or not. 
     # If you decide to crawl it, return True; otherwise return False.
@@ -354,10 +376,12 @@ def is_valid(url):
             return False
 
         if is_seq_filename(parsed.path):
-            crawler.seq_dir_hits[dir_key(hostname, parsed.path)] += 1
+            sk = dir_key(hostname, parsed.path)
+            crawler.seq_dir_hits[sk] = crawler.seq_dir_hits.get(sk, 0) + 1
 
         if parsed.query:
-            crawler.path_hits[path_key(hostname, parsed.path)] += 1
+            pk = path_key(hostname, parsed.path)
+            crawler.path_hits[pk] = crawler.path_hits.get(pk, 0) + 1
 
         return True
 
@@ -367,7 +391,6 @@ def is_valid(url):
 
     except ValueError:
         return False
-
 
 # < HELPER FUNCTIONS >
 
@@ -382,7 +405,6 @@ def is_successful_response(resp):
     if not is_html_response(resp.raw_response):
         return False
     return True
-
 
 # Checks Content-Type header for HTML.
 def is_html_response(raw_response):
@@ -400,11 +422,9 @@ def is_html_response(raw_response):
 
     return main in ("text/html", "application/xhtml+xml")
 
-
 # Checks page bytes within size bounds.
 def has_acceptable_size(page_bytes):
     return MIN_PAGE_BYTES <= len(page_bytes) <= MAX_PAGE_BYTES
-
 
 # Checks hostname against allowed domains.
 def is_allowed_domain(hostname):
@@ -416,7 +436,6 @@ def is_allowed_domain(hostname):
             return True
 
     return False
-
 
 # Checks for disallowed file extension.
 def has_disallowed_extension(path):
@@ -441,12 +460,10 @@ def has_disallowed_extension(path):
         )
     )
 
-
 # Checks for too many path segments.
 def has_too_many_segments(path):
     segments = [segment for segment in path.split("/") if segment]
     return len(segments) > MAX_SEGMENTS
-
 
 # Checks for repeated path segments.
 def has_repeated_segments(path):
@@ -456,7 +473,6 @@ def has_repeated_segments(path):
 
     segment_counts = Counter(segments)
     return max(segment_counts.values()) > MAX_SEGMENT_REPEATS
-
 
 # Detects calendar / date trap URLs.
 def is_calendar_trap(parsed):
@@ -477,7 +493,6 @@ def is_calendar_trap(parsed):
 
     return False
 
-
 # Detects non-HTML export query strings.
 def is_export_query(query):
     if not query:
@@ -494,7 +509,6 @@ def is_export_query(query):
         )
     )
 
-
 # Detects low-information path patterns.
 def is_low_info_path(path):
     return bool(re.search(
@@ -506,11 +520,9 @@ def is_low_info_path(path):
         )
     )
 
-
 # Detects /page/N pagination archives.
 def is_pagination_path(path):
     return bool(re.search(r"/page/\d+(/|$)", path, re.IGNORECASE))
-
 
 # Checks for too many query parameters.
 def has_too_many_params(query):
@@ -520,7 +532,6 @@ def has_too_many_params(query):
     param_count = sum(1 for pair in query.split("&") if pair)
     return param_count > MAX_QUERY_PARAMS
 
-
 # Checks query-variant limit per (host, path).
 def path_hit_limit_reached(parsed, hostname):
     if not parsed.query:
@@ -529,23 +540,19 @@ def path_hit_limit_reached(parsed, hostname):
     key = path_key(hostname, parsed.path)
     return crawler.path_hits.get(key, 0) >= PATH_HIT_LIMIT
 
-
 # Builds (host, path) cache key.
 def path_key(hostname, path):
     return f"{hostname}{path}"
-
 
 # Builds (host, directory) cache key.
 def dir_key(hostname, path):
     dir_prefix = path.rsplit("/", 1)[0] + "/"
     return f"{hostname}{dir_prefix}"
 
-
 # Detects sequential / numeric filenames.
 def is_seq_filename(path):
     filename = path.rsplit("/", 1)[-1]
     return bool(SEQ_FILENAME_RE.match(filename))
-
 
 # Checks sequential-file limit per directory.
 def seq_dir_limit_reached(parsed, hostname):
@@ -555,7 +562,6 @@ def seq_dir_limit_reached(parsed, hostname):
     key = dir_key(hostname, parsed.path)
     return crawler.seq_dir_hits.get(key, 0) >= SEQ_PAGE_LIMIT
 
-
 # Checks visible-text density of page.
 def has_text_density(page_text, page_bytes):
     if not page_bytes:
@@ -564,12 +570,10 @@ def has_text_density(page_text, page_bytes):
     text_bytes = len(page_text.encode("utf-8", errors="ignore"))
     return text_bytes / len(page_bytes) >= MIN_TEXT_DENSITY
 
-
-# Hashes normalized page text.
-def fingerprint(page_text):
+# Hash normalized page text.
+def hash_normalized_page_text(page_text):
     normalized_text = " ".join(page_text.lower().split())
     return hashlib.md5(normalized_text.encode("utf-8", errors="ignore")).hexdigest()
-
 
 if __name__ == "__main__":
     crawler.generate_report()
