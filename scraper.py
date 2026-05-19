@@ -7,17 +7,10 @@ import os
 import re
 from collections import Counter, defaultdict
 from urllib.parse import urldefrag, urljoin, urlparse
-
 from bs4 import BeautifulSoup
 
+# < GLOBAL VARIABLES >
 
-# ============================================================
-# Configuration
-# ============================================================
-
-# The four domains we are allowed to crawl, per the assignment spec.
-# Any hostname that equals one of these or has it as a dotted suffix
-# (e.g. "vision.ics.uci.edu" ends with ".ics.uci.edu") is in scope.
 ALLOWED_DOMAINS = (
     "ics.uci.edu",
     "cs.uci.edu",
@@ -25,98 +18,57 @@ ALLOWED_DOMAINS = (
     "stat.uci.edu",
 )
 
-# Skip pages whose raw byte length is outside this range. The lower bound
-# guards against "dead" 200-OK pages with no real content; the upper bound
-# guards against very large files with low information value.
-MIN_PAGE_BYTES = 500
-MAX_PAGE_BYTES = 5_000_000
+# Filters for exceedingly small/large files.
+MIN_PAGE_BYTES, MAX_PAGE_BYTES = 500, 5000000
 
-# Heuristics for trap detection in is_valid.
-#
-# These rules describe what makes a URL look like a "low information value"
-# page in observable terms (URL shape and observed crawl behavior), rather
-# than naming specific sites. The thresholds were chosen by inspecting
-# Logs/Worker.log and confirming that legitimate UCI pages stay well below
-# them while combinatorial trap pages exceed them rapidly.
+# Trap detection thresholds for is_valid.
 MAX_URL_LENGTH = 300
 MAX_PATH_SEGMENTS = 8
 MAX_PATH_SEGMENT_REPEATS = 2
 
-# Rule B: pages with many query parameters are usually dynamically-generated
-# filter/sort/paginate views with little marginal content.
+# Caps query params before treating URL.
 MAX_QUERY_PARAMS = 3
 
-# Rule A: once we have crawled this many distinct query-string variants of a
-# single (host, path), assume any further variant is part of a combinatorial
-# trap (DokuWiki media manager, calendar pickers, faceted search, etc.).
-# Legitimate UCI content pages rarely produce more than a handful of distinct
-# query-string variants of the same path, so 10 leaves comfortable headroom
-# while cutting off combinatorial traps quickly.
+# Caps distinct query-string variants.
 PATH_HIT_LIMIT = 10
 
-# Rule E: sequential-page traps — once we accept this many URLs whose filename
-# is a bare number or a word-plus-number (nodeN, slideN, pageN, itemN), reject
-# further URLs with the same (host, directory) prefix. This catches things like
-# /slides/node1.html … /slides/node200.html without hard-capping legitimate
-# blog directories where post slugs are words, not numbers.
+# Caps sequential-named files per directory.
 SEQUENTIAL_PAGE_LIMIT = 30
 
-# Per-source-page cap: a single page may contribute at most this many links
-# pointing at the same target directory. Without this, a slide index that
-# enumerates 100 sibling nodes would dump all 100 into the frontier in one
-# extraction call — long before the sequential counter could catch up.
+# Caps links to the same target directory.
 MAX_SAME_DIR_PER_PAGE = 5
 
-# Filenames that are purely numeric or a short word plus a number:
-# node118, slide42, page7, item3, 0042, etc. These are sequential indexing
-# patterns found in slide traps, not human-readable content slugs.
-_SEQUENTIAL_FILENAME_RE = re.compile(
-    r"^(?:[a-z]{0,10})?(\d+)(\.html?)?$", re.IGNORECASE
-)
+# Regex for sequential/numeric filenames.
+_SEQUENTIAL_FILENAME_RE = re.compile(r"^(?:[a-z]{0,10})?(\d+)(\.html?)?$", re.IGNORECASE)
 
-# Rule C: ratio of visible-text bytes to total HTML bytes below which a page
-# is treated as low-information (UI / navigation chrome rather than content).
-# When this is hit we still count the URL as visited but do not propagate
-# its outbound links.
+# Minimum text/HTML ratio for pages.
 MIN_TEXT_DENSITY = 0.05
 
-# Rule F: pages with fewer than this many *report-eligible* words (see
-# _meaningful_tokens_from_text) are thin — count the URL as visited but
-# don't propagate out-links. Catches photo captions, short listings, and
-# placeholder pages that slip past the byte-size and text-density rules.
+# Minimum meaningful word tokens for pages.
 MIN_CONTENT_TOKENS = 18
 
-# For Q2/Q3 only (after HW1 tokenize): English-ish tokens, not citation noise.
-# - Letters only: drops "18", "5x", "3o", etc.
-# - Minimum length 3: drops "ny", two-letter state codes, single doubled chars.
+# Minimum token length for report's word counts.
 MIN_REPORT_WORD_LEN = 3
 
-# Month names/abbrevs appear on almost every dated page; they dominated Q3
-# during early test crawls. Built from the stdlib calendar tables
-# (locale-independent English) rather than hand-maintaining strings. "sept"
-# is a common written form; month_abbr only exposes "sep".
-REPORT_MONTH_STOPWORDS = (
-    frozenset(calendar.month_abbr[i].lower() for i in range(1, 13))
-    | frozenset(calendar.month_name[i].lower() for i in range(1, 13))
-    | frozenset({"sept"})
-)
+# Month names/abbrevs to exclude from word counts.
+REPORT_MONTH_STOPWORDS = frozenset(calendar.month_abbr[i].lower() for i in range(1, 13)) | frozenset(calendar.month_name[i].lower() for i in range(1, 13)) | frozenset({"sept"})
 
-# Persisted state and report file locations (relative to project root).
+# Persisted state and report file locations.
 STOP_WORDS_FILE = "stop_words.txt"
 ANALYTICS_FILE = "analytics.json"
 REPORT_FILE = "report.txt"
 
-# Flush analytics to disk every N newly-crawled pages.
+# Flushes analytics to disk every N pages.
 SAVE_EVERY_N_PAGES = 25
 
 
-# ============================================================
-# Stop words
-# ============================================================
+# < STOP WORDS >
 
+# Loads stop words from disk.
 def load_stop_words(path):
     if not os.path.exists(path):
         return set()
+
     with open(path, encoding="utf-8") as stop_words_file:
         return {line.strip().lower() for line in stop_words_file if line.strip()}
 
@@ -124,11 +76,9 @@ def load_stop_words(path):
 STOP_WORDS = load_stop_words(STOP_WORDS_FILE)
 
 
-# ============================================================
-# Tokenization
-# ============================================================
+# < TOKENIZATION >
 
-# Same algorithm as hw1/PartA.py (Assignment 1)
+# Tokenizes text into alphanumeric ASCII tokens.
 def tokenize(text):
     tokens = []
     current = []
@@ -138,9 +88,11 @@ def tokenize(text):
         chunk = f.read(4096)
         if not chunk:
             break
+
         for char in chunk:
             if char.isascii() and char.isalnum():
                 current.append(char.lower())
+
             else:
                 if len(current) > 0:
                     tokens.append("".join(current))
@@ -152,11 +104,8 @@ def tokenize(text):
     return tokens
 
 
+# Filters tokens for report eligibility.
 def _meaningful_tokens_from_text(text):
-    # HW1 tokenize(), then Q2/Q3 filters. The assignment only requires the
-    # stop_words.txt filter, but additionally dropping pure-digit and mixed
-    # alphanumeric citation noise ("18", "5x", "p3") and month names keeps
-    # the top-50 list from being dominated by calendar/reference junk.
     eligible = []
     for token in tokenize(text):
         if len(token) < MIN_REPORT_WORD_LEN:
@@ -169,10 +118,9 @@ def _meaningful_tokens_from_text(text):
     return eligible
 
 
-# ============================================================
-# Analytics state (persisted across crawler runs)
-# ============================================================
+# < ANALYTICS STATE >
 
+# Returns empty analytics state.
 def _empty_analytics():
     return {
         "unique_urls": set(),
@@ -180,19 +128,13 @@ def _empty_analytics():
         "longest_page_word_count": 0,
         "word_counts": Counter(),
         "subdomain_pages": defaultdict(set),
-        # Rule A state: how many times we've crawled each (host, path) regardless
-        # of query string. Key format: "<hostname><path>" (e.g. "wiki.ics.uci.edu/doku.php/foo").
         "path_hits": defaultdict(int),
-        # Rule E state: count of sequential-named filenames (nodeN, slideN, pageN,
-        # etc.) accepted per (host, directory). Only these patterns trigger the cap —
-        # word-slug filenames (real blog posts) are not counted here.
         "seq_dir_hits": defaultdict(int),
-        # Rule D state: fingerprints of normalized page text we have already seen,
-        # used to skip propagating links from exact-duplicate pages.
         "content_hashes": set(),
     }
 
 
+# Loads persisted analytics state from disk.
 def load_analytics(path):
     if not os.path.exists(path):
         return _empty_analytics()
@@ -206,13 +148,7 @@ def load_analytics(path):
         "longest_page_url": saved_state.get("longest_page_url", ""),
         "longest_page_word_count": saved_state.get("longest_page_word_count", 0),
         "word_counts": Counter(saved_state.get("word_counts", {})),
-        "subdomain_pages": defaultdict(
-            set,
-            {
-                hostname: set(urls)
-                for hostname, urls in saved_state.get("subdomain_pages", {}).items()
-            },
-        ),
+        "subdomain_pages": defaultdict(set, {hostname: set(urls) for hostname, urls in saved_state.get("subdomain_pages", {}).items()}),
         "path_hits": defaultdict(int, saved_state.get("path_hits", {})),
         "seq_dir_hits": defaultdict(int, saved_state.get("seq_dir_hits", {})),
         "content_hashes": set(saved_state.get("content_hashes", [])),
@@ -223,16 +159,14 @@ analytics = load_analytics(ANALYTICS_FILE)
 _pages_since_last_save = 0
 
 
+# Saves analytics state to disk.
 def save_analytics(path=ANALYTICS_FILE):
     snapshot = {
         "unique_urls": sorted(analytics["unique_urls"]),
         "longest_page_url": analytics["longest_page_url"],
         "longest_page_word_count": analytics["longest_page_word_count"],
         "word_counts": dict(analytics["word_counts"]),
-        "subdomain_pages": {
-            hostname: sorted(urls)
-            for hostname, urls in analytics["subdomain_pages"].items()
-        },
+        "subdomain_pages": {hostname: sorted(urls) for hostname, urls in analytics["subdomain_pages"].items()},
         "path_hits": dict(analytics["path_hits"]),
         "seq_dir_hits": dict(analytics["seq_dir_hits"]),
         "content_hashes": sorted(analytics["content_hashes"]),
@@ -244,17 +178,11 @@ def save_analytics(path=ANALYTICS_FILE):
 atexit.register(save_analytics)
 
 
+# Writes report answers to disk.
 def generate_report(path=REPORT_FILE):
-    """Write answers to the four report questions to a text file."""
     lines = []
-    lines.append(
-        f"1. Unique pages found: {len(analytics['unique_urls'])}\n\n"
-    )
-    lines.append(
-        "2. Longest page (by word count): "
-        f"{analytics['longest_page_url']} "
-        f"({analytics['longest_page_word_count']} words)\n\n"
-    )
+    lines.append(f"1. Unique pages found: {len(analytics['unique_urls'])}\n\n")
+    lines.append(f"2. Longest page (by word count): {analytics['longest_page_url']} ({analytics['longest_page_word_count']} words)\n\n")
 
     lines.append("3. 50 most common words (word, count):\n")
     for word, count in analytics["word_counts"].most_common(50):
@@ -270,9 +198,7 @@ def generate_report(path=REPORT_FILE):
         report_file.writelines(lines)
 
 
-# ============================================================
-# Required crawler interface
-# ============================================================
+# < REQUIRED CRAWLER INTERFACE >
 
 def scraper(url, resp):
     links = extract_next_links(url, resp)
@@ -280,13 +206,15 @@ def scraper(url, resp):
 
 
 def extract_next_links(url, resp):
+    # Implementation required.
     # url: the URL that was used to get the page
     # resp.url: the actual url of the page
-    # resp.status: the status code returned by the server (200 is OK)
-    # resp.error: when status is not 200, this contains the error
-    # resp.raw_response: the underlying response object
-    #     resp.raw_response.url: the url, again
-    #     resp.raw_response.content: the raw HTML bytes of the page
+    # resp.status: the status code returned by the server. 200 is OK, you got the page. Other numbers mean that there was some kind of problem.
+    # resp.error: when status is not 200, you can check the error here, if needed.
+    # resp.raw_response: this is where the page actually is. More specifically, the raw_response has two parts:
+    #         resp.raw_response.url: the url, again
+    #         resp.raw_response.content: the content of the page!
+    # Return a list with the hyperlinks (as strings) scrapped from resp.raw_response.content
     if not _is_successful_response(resp):
         return []
 
@@ -301,29 +229,22 @@ def extract_next_links(url, resp):
     except Exception:
         return []
 
-    # Strip <script> and <style> bodies before extracting text. By default
-    # get_text() includes their contents, which leaks JS and CSS rules
-    # (e.g. "padding: 5px", "color: #fff") into the word counts.
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
     page_text = soup.get_text(separator=" ")
 
-    # Rule C: pages with very little visible text relative to their HTML
-    # payload are UI / navigation pages, not content. Rule D: pages whose
-    # normalized text matches a previously-seen page are exact duplicates.
-    # Rule F: pages with too few meaningful word tokens are thin
-    # caption/listing pages. In every case we still count the URL as visited
-    # (so the unique-page count reflects reality), but we don't propagate
-    # outbound links — that's what fuels combinatorial traps.
     is_content_bearing = _has_sufficient_text_density(page_text, page_bytes)
     meaningful_word_tokens = _meaningful_tokens_from_text(page_text)
+
     if is_content_bearing and len(meaningful_word_tokens) < MIN_CONTENT_TOKENS:
         is_content_bearing = False
+
     if is_content_bearing:
         content_hash = _content_fingerprint(page_text)
         if content_hash in analytics["content_hashes"]:
             is_content_bearing = False
+
         else:
             analytics["content_hashes"].add(content_hash)
 
@@ -332,14 +253,6 @@ def extract_next_links(url, resp):
     if not is_content_bearing:
         return []
 
-    # Two per-source-page caps work together with the is_valid budgets:
-    #   1. seen_target_path_keys: emit at most one URL per (host, path), so
-    #      50 query-string variants of /doku.php/foo collapse to a single
-    #      link — the "ever changing URLs" trap signature from Lecture 7.
-    #   2. target_dir_counts: cap same-directory sequential-named URLs at
-    #      MAX_SAME_DIR_PER_PAGE per source. Non-sequential URLs (word
-    #      slugs) are not capped so legitimate listing pages (faculty
-    #      pubs, news, course indexes) keep their link breadth.
     extracted_links = []
     seen_target_path_keys = set()
     target_dir_counts = Counter()
@@ -347,21 +260,22 @@ def extract_next_links(url, resp):
         href_value = anchor_tag["href"].strip()
         if not href_value:
             continue
-        # Some pages contain malformed anchors (e.g. href="http://[YOUR_IP]:8080/..."
-        # placeholder text in tutorials). Python 3.10's urlparse validates
-        # bracketed netlocs as IPv6 addresses and raises ValueError on text
-        # like "YOUR_IP", which would otherwise kill the worker thread.
+
         try:
             absolute_url = urljoin(base_url, href_value)
             defragmented_url, _fragment = urldefrag(absolute_url)
             if not defragmented_url:
                 continue
+
             parsed_target = urlparse(defragmented_url)
+
         except ValueError:
             continue
+
         target_path_key = (parsed_target.netloc, parsed_target.path)
         if target_path_key in seen_target_path_keys:
             continue
+
         seen_target_path_keys.add(target_path_key)
 
         if _is_sequential_filename(parsed_target.path):
@@ -369,6 +283,7 @@ def extract_next_links(url, resp):
             target_dir_key = _dir_key(target_hostname, parsed_target.path)
             if target_dir_counts[target_dir_key] >= MAX_SAME_DIR_PER_PAGE:
                 continue
+
             target_dir_counts[target_dir_key] += 1
 
         extracted_links.append(defragmented_url)
@@ -377,63 +292,63 @@ def extract_next_links(url, resp):
 
 
 def is_valid(url):
-    # Decide whether to crawl this url or not.
-    # Returns True if the url should be added to the frontier, False otherwise.
+    # Decide whether to crawl this url or not. 
+    # If you decide to crawl it, return True; otherwise return False.
+    # There are already some conditions that return False.
     try:
-        parsed_url = urlparse(url)
-        if parsed_url.scheme not in {"http", "https"}:
+        parsed = urlparse(url)
+        if parsed.scheme not in set(["http", "https"]):
             return False
 
-        hostname = (parsed_url.hostname or "").lower()
+        hostname = (parsed.hostname or "").lower()
         if not _is_in_allowed_domains(hostname):
             return False
 
-        if _has_disallowed_extension(parsed_url.path):
+        if _has_disallowed_extension(parsed.path):
             return False
 
-        if _is_pagination_archive(parsed_url.path):
+        if _is_pagination_archive(parsed.path):
             return False
 
-        if _is_low_info_path(parsed_url.path):
+        if _is_low_info_path(parsed.path):
             return False
 
         if len(url) > MAX_URL_LENGTH:
             return False
-        if _has_too_many_path_segments(parsed_url.path):
+        if _has_too_many_path_segments(parsed.path):
             return False
-        if _has_repeated_path_segments(parsed_url.path):
+        if _has_repeated_path_segments(parsed.path):
             return False
-        if _looks_like_calendar_trap(parsed_url):
+        if _looks_like_calendar_trap(parsed):
             return False
-        if _is_non_html_export_query(parsed_url.query):
+        if _is_non_html_export_query(parsed.query):
             return False
-        if _has_too_many_query_params(parsed_url.query):
+        if _has_too_many_query_params(parsed.query):
             return False
-        if _path_hit_limit_reached(parsed_url, hostname):
+        if _path_hit_limit_reached(parsed, hostname):
             return False
-        if _seq_dir_limit_reached(parsed_url, hostname):
+        if _seq_dir_limit_reached(parsed, hostname):
             return False
 
-        # Reserve a slot in the sequential-dir budget (if applicable) and the
-        # query-variant budget now, at extraction time, so burst extractions
-        # can't blow past the limits before any of them are actually crawled.
-        if _is_sequential_filename(parsed_url.path):
-            analytics["seq_dir_hits"][_dir_key(hostname, parsed_url.path)] += 1
-        if parsed_url.query:
-            analytics["path_hits"][_path_key(hostname, parsed_url.path)] += 1
+        if _is_sequential_filename(parsed.path):
+            analytics["seq_dir_hits"][_dir_key(hostname, parsed.path)] += 1
+
+        if parsed.query:
+            analytics["path_hits"][_path_key(hostname, parsed.path)] += 1
+
         return True
 
-    except (TypeError, ValueError):
-        # urlparse can raise TypeError if url is not a string and ValueError
-        # on malformed bracketed netlocs (e.g. http://[YOUR_IP]:8080/...).
-        # Either way, treat the URL as uncrawlable.
+    except TypeError:
+        print ("TypeError for ", parsed)
+        return False
+
+    except ValueError:
         return False
 
 
-# ============================================================
-# Helper functions
-# ============================================================
+< HELPER FUNCTIONS >
 
+# Checks for usable HTTP 200 HTML response.
 def _is_successful_response(resp):
     if resp.status != 200:
         return False
@@ -446,110 +361,102 @@ def _is_successful_response(resp):
     return True
 
 
+# Checks Content-Type header for HTML.
 def _response_content_type_is_html(raw_response):
-    # Only treat the body as HTML when the server says so. Stops .ppsx, PDFs,
-    # octet-stream binaries, etc. from polluting BeautifulSoup and word stats
-    # when they're served at extension-less URLs that slip past the regex.
     headers = getattr(raw_response, "headers", None)
     if headers is None:
         return True
+
     content_type = ""
     if hasattr(headers, "get"):
         content_type = headers.get("Content-Type") or headers.get("content-type") or ""
+
     main = str(content_type).split(";")[0].strip().lower()
     if not main:
         return True
+
     return main in ("text/html", "application/xhtml+xml")
 
 
+# Checks page bytes within size bounds.
 def _has_acceptable_size(page_bytes):
     return MIN_PAGE_BYTES <= len(page_bytes) <= MAX_PAGE_BYTES
 
 
+# Checks hostname against allowed domains.
 def _is_in_allowed_domains(hostname):
     if not hostname:
         return False
+
     for domain in ALLOWED_DOMAINS:
         if hostname == domain or hostname.endswith("." + domain):
             return True
+
     return False
 
 
+# Checks for disallowed file extension.
 def _has_disallowed_extension(path):
     return bool(
         re.match(
             r".*\.(css|js|bmp|gif|jpe?g|ico"
-            r"|png|tiff?|mid|mp2|mp3|mp4"
-            r"|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
-            r"|ps|eps|tex|ppt|pptx|pps|ppsx|pptm|ppsm"
-            r"|doc|docx|docm|xls|xlsx|xlsm|names"
-            r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
-            r"|epub|dll|cnf|tgz|sha1|ipynb|nb"
-            r"|txt|md|log|yaml|yml|conf|cfg|ini"
-            r"|sql|sqlite|odb|accdb|mdb"
-            r"|odp|ods|odt|odg|key|pages|numbers"
-            r"|c|cc|cpp|cxx|h|hpp|hxx|java|py|rb|pl|go|rs|swift|kt"
-            r"|ff|bib|sty|bst|cls"
-            r"|thmx|mso|arff|rtf|jar|war|ear|apk|csv"
-            r"|wasm|ipa|pkg|deb|rpm|xz|lzma|zst"
-            r"|rm|smil|wmv|swf|wma|zip|rar|gz)$",
+            + r"|png|tiff?|mid|mp2|mp3|mp4"
+            + r"|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
+            + r"|ps|eps|tex|ppt|pptx|pps|ppsx|pptm|ppsm"
+            + r"|doc|docx|docm|xls|xlsx|xlsm|names"
+            + r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
+            + r"|epub|dll|cnf|tgz|sha1|ipynb|nb"
+            + r"|txt|md|log|yaml|yml|conf|cfg|ini"
+            + r"|sql|sqlite|odb|accdb|mdb"
+            + r"|odp|ods|odt|odg|key|pages|numbers"
+            + r"|c|cc|cpp|cxx|h|hpp|hxx|java|py|rb|pl|go|rs|swift|kt"
+            + r"|ff|bib|sty|bst|cls"
+            + r"|thmx|mso|arff|rtf|jar|war|ear|apk|csv"
+            + r"|wasm|ipa|pkg|deb|rpm|xz|lzma|zst"
+            + r"|rm|smil|wmv|swf|wma|zip|rar|gz)$",
             path.lower(),
         )
     )
 
 
+# Checks for too many path segments.
 def _has_too_many_path_segments(path):
     segments = [segment for segment in path.split("/") if segment]
     return len(segments) > MAX_PATH_SEGMENTS
 
 
+# Checks for repeated path segments.
 def _has_repeated_path_segments(path):
     segments = [segment for segment in path.split("/") if segment]
     if not segments:
         return False
+
     segment_counts = Counter(segments)
     return max(segment_counts.values()) > MAX_PATH_SEGMENT_REPEATS
 
 
+# Detects calendar / date trap URLs.
 def _looks_like_calendar_trap(parsed_url):
-    # Per CS121 Discussion 3 ("Keep Your Crawler Away From: Calendars, things
-    # that end with a date, things that end with events-week..."), this
-    # function looks for URL shapes that are almost always calendar/event
-    # navigation UIs rather than content. Each branch is a distinct shape
-    # we've seen or that the discussion called out.
     path = parsed_url.path
     query = parsed_url.query.lower()
 
-    # Date archive pages — the date must be at the END of the path. Without
-    # the end-anchor, this also catches WordPress permalinks like
-    # /2024/03/some-post/ where the date is a prefix to real content, and
-    # silently drops those posts at is_valid.
-    if re.search(r"/\d{4}-\d{2}-\d{2}/?$", path):  # ISO date archive
+    if re.search(r"/\d{4}-\d{2}-\d{2}/?$", path):
         return True
-    if re.search(r"/(19|20)\d{2}(/\d{1,2}){0,2}/?$", path):  # /YYYY, /YYYY/MM, /YYYY/MM/DD
+
+    if re.search(r"/(19|20)\d{2}(/\d{1,2}){0,2}/?$", path):
         return True
-    # Event/calendar UI navigation pages: /events/week/..., /calendar/month/...
+
     if re.search(r"/(events?|calendar)/(week|day|month|year)\b", path):
         return True
 
-    # Date-style query keys typically used to page through calendar views.
-    if re.search(
-        r"\b(year|month|day|date|when|eventdate|startdate|enddate|from|to|after|before)=\d",
-        query,
-    ):
+    if re.search(r"\b(year|month|day|date|when|eventdate|startdate|enddate|from|to|after|before)=\d", query):
         return True
 
     return False
 
 
+# Detects non-HTML export query strings.
 def _is_non_html_export_query(query):
-    # Reject URLs whose query string asks for a non-HTML representation of an
-    # already-crawled page (DokuWiki ?do=export_pdf / export_xhtml, MediaWiki
-    # ?action=raw / ?action=edit, generic ?format=pdf|xml|json, etc.).
-    # These responses are either binary (PDF) — which causes BeautifulSoup to
-    # emit "REPLACEMENT CHARACTER" decoding warnings — or non-content UI
-    # views, and they never contribute new information beyond the canonical
-    # page already in scope.
     if not query:
         return False
     return bool(
@@ -565,22 +472,9 @@ def _is_non_html_export_query(query):
     )
 
 
+# Detects low-information path patterns.
 def _is_low_info_path(path):
-    # Path patterns that consistently produce "sets of similar pages with no
-    # information" (assignment criterion) or non-HTML downloads served at
-    # extension-less URLs. Each pattern is justified by an observed crawl:
-    #
-    #   pix/photos/gallery/albums  — faculty photo galleries (eppstein/pix/*);
-    #     top 50 words were dominated by EXIF (mm, iso, canon, eos, crw).
-    #   genealogy/family-tree/ancestry/surnames  — genealogy databases
-    #     (~dhirschb/genealogy/Krakow); top 50 words were dominated by
-    #     months (jan, feb, ...) and family-record fields (married, krakow,
-    #     podgorze, abraham, manhattan).
-    #   zip-attachment/raw-attachment  — Trac wiki download views; the URL
-    #     has no file extension but the response body is binary (zip/pdf)
-    #     and was the source of the 65,578-word "longest page".
-    return bool(
-        re.search(
+    return bool(re.search(
             r"/(pix|photos?|gallery|galleries|albums?"
             r"|genealogy|family[-_]?tree|ancestry|surnames?"
             r"|zip[-_]?attachment|raw[-_]?attachment)(/|$)",
@@ -590,80 +484,71 @@ def _is_low_info_path(path):
     )
 
 
+# Detects /page/N pagination archives.
 def _is_pagination_archive(path):
-    # WordPress and similar CMSes generate paginated archive views at paths
-    # like /blog/page/3/, /author/ramesh/page/12/, /category/news/page/5/.
-    # These pages list the same posts that are reachable directly from the
-    # first listing page; crawling page/50 adds no new content, just reraises
-    # duplicate links. Block any path whose last numeric component is reached
-    # via a /page/ segment.
     return bool(re.search(r"/page/\d+(/|$)", path, re.IGNORECASE))
 
 
+# Checks for too many query parameters.
 def _has_too_many_query_params(query):
-    # Rule B: a URL with many query parameters is almost always a dynamically
-    # generated view (filter/sort/paginate/faceted-search) rather than a unique
-    # content page. We allow up to MAX_QUERY_PARAMS for normal use cases.
     if not query:
         return False
+
     param_count = sum(1 for pair in query.split("&") if pair)
     return param_count > MAX_QUERY_PARAMS
 
 
+# Checks query-variant limit per (host, path).
 def _path_hit_limit_reached(parsed_url, hostname):
-    # Rule A: combinatorial trap detection. If we have already crawled many
-    # variants of this (host, path) under different query strings, refuse any
-    # further variant. URLs without a query string are always allowed through,
-    # so the canonical page itself is never blocked.
     if not parsed_url.query:
         return False
+
     path_key = _path_key(hostname, parsed_url.path)
     return analytics["path_hits"].get(path_key, 0) >= PATH_HIT_LIMIT
 
 
+# Builds (host, path) cache key.
 def _path_key(hostname, path):
     return f"{hostname}{path}"
 
 
+# Builds (host, directory) cache key.
 def _dir_key(hostname, path):
-    # Directory prefix: everything up to and including the last slash.
     dir_prefix = path.rsplit("/", 1)[0] + "/"
     return f"{hostname}{dir_prefix}"
 
 
+# Detects sequential / numeric filenames.
 def _is_sequential_filename(path):
     filename = path.rsplit("/", 1)[-1]
     return bool(_SEQUENTIAL_FILENAME_RE.match(filename))
 
 
+# Checks sequential-file limit per directory.
 def _seq_dir_limit_reached(parsed_url, hostname):
-    # Rule E: only count and limit URLs whose filename looks sequential.
-    # Regular blog post slugs ("towards-weaving-the-visual-web") are not
-    # affected; only numeric-indexed files (node42.html, slide7) are capped.
     if not _is_sequential_filename(parsed_url.path):
         return False
+
     dir_key = _dir_key(hostname, parsed_url.path)
     return analytics["seq_dir_hits"].get(dir_key, 0) >= SEQUENTIAL_PAGE_LIMIT
 
 
+# Checks visible-text density of page.
 def _has_sufficient_text_density(page_text, page_bytes):
-    # Rule C: ratio of visible text bytes to total HTML bytes. Pages that are
-    # mostly markup with little actual prose tend to be UI/action views.
     if not page_bytes:
         return False
+
     text_bytes = len(page_text.encode("utf-8", errors="ignore"))
     return text_bytes / len(page_bytes) >= MIN_TEXT_DENSITY
 
 
+# Hashes normalized page text.
 def _content_fingerprint(page_text):
-    # Rule D: stable hash over normalized text so two pages that render the
-    # same prose (modulo whitespace and casing) collide. Used to detect exact
-    # near-duplicates such as DokuWiki action variants that all wrap the same
-    # underlying article.
     normalized_text = " ".join(page_text.lower().split())
     return hashlib.md5(normalized_text.encode("utf-8", errors="ignore")).hexdigest()
 
 
+# Updates analytics state for crawled page.
 def record_page_analytics(page_url, meaningful_word_tokens, is_content_bearing):
     global _pages_since_last_save
 
@@ -674,23 +559,18 @@ def record_page_analytics(page_url, meaningful_word_tokens, is_content_bearing):
     parsed = urlparse(defragmented_url)
     hostname = (parsed.hostname or "").lower()
 
-    # Note: path_hits and seq_dir_hits are reserved in is_valid at extraction
-    # time, not here, so bursts of same-dir links from a single source page
-    # can't blow past their limits before any of them are actually crawled.
-
     is_new_url = defragmented_url not in analytics["unique_urls"]
     if is_new_url:
         analytics["unique_urls"].add(defragmented_url)
+
         if hostname == "uci.edu" or hostname.endswith(".uci.edu"):
             analytics["subdomain_pages"][hostname].add(defragmented_url)
 
-    # Only content-bearing pages contribute to the longest-page and word-count
-    # analytics. UI / duplicate pages would otherwise drown the report in
-    # boilerplate words ("edit", "preview", "namespace", "history", ...).
     if is_content_bearing and is_new_url:
         if len(meaningful_word_tokens) > analytics["longest_page_word_count"]:
             analytics["longest_page_word_count"] = len(meaningful_word_tokens)
             analytics["longest_page_url"] = defragmented_url
+            
         for word in meaningful_word_tokens:
             if word not in STOP_WORDS:
                 analytics["word_counts"][word] += 1
