@@ -5,8 +5,8 @@ import io
 import json
 import os
 import re
-from collections import Counter, defaultdict
 from urllib.parse import urldefrag, urljoin, urlparse
+from collections import Counter, defaultdict
 from bs4 import BeautifulSoup
 
 # < GLOBAL VARIABLES >
@@ -23,8 +23,8 @@ MIN_PAGE_BYTES, MAX_PAGE_BYTES = 500, 5000000
 
 # Trap detection thresholds for is_valid.
 MAX_URL_LENGTH = 300
-MAX_PATH_SEGMENTS = 8
-MAX_PATH_SEGMENT_REPEATS = 2
+MAX_SEGMENTS = 8
+MAX_SEGMENT_REPEATS = 2
 
 # Caps query params before treating URL.
 MAX_QUERY_PARAMS = 3
@@ -33,13 +33,13 @@ MAX_QUERY_PARAMS = 3
 PATH_HIT_LIMIT = 10
 
 # Caps sequential-named files per directory.
-SEQUENTIAL_PAGE_LIMIT = 30
+SEQ_PAGE_LIMIT = 30
 
 # Caps links to the same target directory.
-MAX_SAME_DIR_PER_PAGE = 5
+MAX_DIR_PER_PAGE = 5
 
 # Regex for sequential/numeric filenames.
-_SEQUENTIAL_FILENAME_RE = re.compile(r"^(?:[a-z]{0,10})?(\d+)(\.html?)?$", re.IGNORECASE)
+SEQ_FILENAME_RE = re.compile(r"^(?:[a-z]{0,10})?(\d+)(\.html?)?$", re.IGNORECASE)
 
 # Minimum text/HTML ratio for pages.
 MIN_TEXT_DENSITY = 0.05
@@ -51,7 +51,7 @@ MIN_CONTENT_TOKENS = 18
 MIN_REPORT_WORD_LEN = 3
 
 # Month names/abbrevs to exclude from word counts.
-REPORT_MONTH_STOPWORDS = frozenset(calendar.month_abbr[i].lower() for i in range(1, 13)) | frozenset(calendar.month_name[i].lower() for i in range(1, 13)) | frozenset({"sept"})
+MONTH_STOPWORDS = frozenset(calendar.month_abbr[i].lower() for i in range(1, 13)) | frozenset(calendar.month_name[i].lower() for i in range(1, 13)) | frozenset({"sept"})
 
 # Persisted state and report file locations.
 STOP_WORDS_FILE = "stop_words.txt"
@@ -59,7 +59,7 @@ ANALYTICS_FILE = "analytics.json"
 REPORT_FILE = "report.txt"
 
 # Flushes analytics to disk every N pages.
-SAVE_EVERY_N_PAGES = 25
+SAVE_INTERVAL = 25
 
 
 # < STOP WORDS >
@@ -73,12 +73,10 @@ def load_stop_words(path):
         return {line.strip().lower() for line in stop_words_file if line.strip()}
 
 
-STOP_WORDS = load_stop_words(STOP_WORDS_FILE)
-
-
 # < TOKENIZATION >
 
 # Tokenizes text into alphanumeric ASCII tokens.
+# Same tokeninzer from HW1
 def tokenize(text):
     tokens = []
     current = []
@@ -105,14 +103,14 @@ def tokenize(text):
 
 
 # Filters tokens for report eligibility.
-def _meaningful_tokens_from_text(text):
+def meaningful_tokens(text):
     eligible = []
     for token in tokenize(text):
         if len(token) < MIN_REPORT_WORD_LEN:
             continue
         if not token.isalpha():
             continue
-        if token in REPORT_MONTH_STOPWORDS:
+        if token in MONTH_STOPWORDS:
             continue
         eligible.append(token)
     return eligible
@@ -120,86 +118,110 @@ def _meaningful_tokens_from_text(text):
 
 # < ANALYTICS STATE >
 
-# Returns empty analytics state.
-def _empty_analytics():
-    return {
-        "unique_urls": set(),
-        "longest_page_url": "",
-        "longest_page_word_count": 0,
-        "word_counts": Counter(),
-        "subdomain_pages": defaultdict(set),
-        "path_hits": defaultdict(int),
-        "seq_dir_hits": defaultdict(int),
-        "content_hashes": set(),
-    }
+class Crawler:
+    def __init__(self, analytics_file=ANALYTICS_FILE, stop_words_file=STOP_WORDS_FILE):
+        self.analytics_file = analytics_file
+        self.stop_words = load_stop_words(stop_words_file)
+        self.unique_urls = set()
+        self.longest_page_url = ""
+        self.longest_word_count = 0
+        self.word_counts = Counter()
+        self.subdomain_pages = defaultdict(set)
+        self.path_hits = defaultdict(int)
+        self.seq_dir_hits = defaultdict(int)
+        self.content_hashes = set()
+        self.pages_since_save = 0
+        self.load(analytics_file)
+
+    # Loads persisted analytics state from disk.
+    def load(self, path):
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as analytics_file:
+                saved_state = json.load(analytics_file)
+        except (json.JSONDecodeError, OSError):
+            return
+        self.unique_urls = set(saved_state.get("unique_urls", []))
+        self.longest_page_url = saved_state.get("longest_page_url", "")
+        self.longest_word_count = saved_state.get("longest_word_count", 0)
+        self.word_counts = Counter(saved_state.get("word_counts", {}))
+        self.subdomain_pages = defaultdict(set, {hostname: set(urls) for hostname, urls in saved_state.get("subdomain_pages", {}).items()})
+        self.path_hits = defaultdict(int, saved_state.get("path_hits", {}))
+        self.seq_dir_hits = defaultdict(int, saved_state.get("seq_dir_hits", {}))
+        self.content_hashes = set(saved_state.get("content_hashes", []))
+
+    # Saves analytics state to disk.
+    def save(self):
+        snapshot = {
+            "unique_urls": sorted(self.unique_urls),
+            "longest_page_url": self.longest_page_url,
+            "longest_word_count": self.longest_word_count,
+            "word_counts": dict(self.word_counts),
+            "subdomain_pages": {hostname: sorted(urls) for hostname, urls in self.subdomain_pages.items()},
+            "path_hits": dict(self.path_hits),
+            "seq_dir_hits": dict(self.seq_dir_hits),
+            "content_hashes": sorted(self.content_hashes),
+        }
+        with open(self.analytics_file, "w", encoding="utf-8") as analytics_file:
+            json.dump(snapshot, analytics_file, indent=2)
+
+    # Writes report answers to disk.
+    def generate_report(self, path=REPORT_FILE):
+        lines = []
+
+        lines.append(f"1. Unique pages found: {len(self.unique_urls)}\n\n")
+        lines.append(f"2. Longest page (by word count): {self.longest_page_url} ({self.longest_word_count} words)\n\n")
+
+        lines.append("3. 50 most common words (word, count):\n")
+        for word, count in self.word_counts.most_common(50):
+            lines.append(f"{word}, {count}\n")
+        lines.append("\n")
+
+        lines.append("4. Subdomains under uci.edu (subdomain, unique pages):\n")
+        for hostname in sorted(self.subdomain_pages):
+            page_count = len(self.subdomain_pages[hostname])
+            lines.append(f"{hostname}, {page_count}\n")
+
+        with open(path, "w", encoding="utf-8") as report_file:
+            report_file.writelines(lines)
+
+    # Updates analytics state for crawled page.
+    def record_page(self, page_url, tokens, is_content):
+        clean_url = urldefrag(page_url)[0]
+        if not clean_url:
+            return
+
+        parsed = urlparse(clean_url)
+        hostname = (parsed.hostname or "").lower()
+
+        is_new = clean_url not in self.unique_urls
+        if is_new:
+            self.unique_urls.add(clean_url)
+
+            if hostname == "uci.edu" or hostname.endswith(".uci.edu"):
+                self.subdomain_pages[hostname].add(clean_url)
+
+        if is_content and is_new:
+            if len(tokens) > self.longest_word_count:
+                self.longest_word_count = len(tokens)
+                self.longest_page_url = clean_url
+
+            for word in tokens:
+                if word not in self.stop_words:
+                    self.word_counts[word] += 1
+
+        self.pages_since_save += 1
+        if self.pages_since_save >= SAVE_INTERVAL:
+            self.save()
+            self.pages_since_save = 0
 
 
-# Loads persisted analytics state from disk.
-def load_analytics(path):
-    if not os.path.exists(path):
-        return _empty_analytics()
-    try:
-        with open(path, encoding="utf-8") as analytics_file:
-            saved_state = json.load(analytics_file)
-    except (json.JSONDecodeError, OSError):
-        return _empty_analytics()
-    return {
-        "unique_urls": set(saved_state.get("unique_urls", [])),
-        "longest_page_url": saved_state.get("longest_page_url", ""),
-        "longest_page_word_count": saved_state.get("longest_page_word_count", 0),
-        "word_counts": Counter(saved_state.get("word_counts", {})),
-        "subdomain_pages": defaultdict(set, {hostname: set(urls) for hostname, urls in saved_state.get("subdomain_pages", {}).items()}),
-        "path_hits": defaultdict(int, saved_state.get("path_hits", {})),
-        "seq_dir_hits": defaultdict(int, saved_state.get("seq_dir_hits", {})),
-        "content_hashes": set(saved_state.get("content_hashes", [])),
-    }
+crawler = Crawler()
+atexit.register(crawler.save)
 
 
-analytics = load_analytics(ANALYTICS_FILE)
-_pages_since_last_save = 0
-
-
-# Saves analytics state to disk.
-def save_analytics(path=ANALYTICS_FILE):
-    snapshot = {
-        "unique_urls": sorted(analytics["unique_urls"]),
-        "longest_page_url": analytics["longest_page_url"],
-        "longest_page_word_count": analytics["longest_page_word_count"],
-        "word_counts": dict(analytics["word_counts"]),
-        "subdomain_pages": {hostname: sorted(urls) for hostname, urls in analytics["subdomain_pages"].items()},
-        "path_hits": dict(analytics["path_hits"]),
-        "seq_dir_hits": dict(analytics["seq_dir_hits"]),
-        "content_hashes": sorted(analytics["content_hashes"]),
-    }
-    with open(path, "w", encoding="utf-8") as analytics_file:
-        json.dump(snapshot, analytics_file, indent=2)
-
-
-atexit.register(save_analytics)
-
-
-# Writes report answers to disk.
-def generate_report(path=REPORT_FILE):
-    lines = []
-
-    lines.append(f"1. Unique pages found: {len(analytics['unique_urls'])}\n\n")
-    lines.append(f"2. Longest page (by word count): {analytics['longest_page_url']} ({analytics['longest_page_word_count']} words)\n\n")
-
-    lines.append("3. 50 most common words (word, count):\n")
-    for word, count in analytics["word_counts"].most_common(50):
-        lines.append(f"{word}, {count}\n")
-    lines.append("\n")
-
-    lines.append("4. Subdomains under uci.edu (subdomain, unique pages):\n")
-    for hostname in sorted(analytics["subdomain_pages"]):
-        page_count = len(analytics["subdomain_pages"][hostname])
-        lines.append(f"{hostname}, {page_count}\n")
-
-    with open(path, "w", encoding="utf-8") as report_file:
-        report_file.writelines(lines)
-
-
-# < REQUIRED CRAWLER INTERFACE >
+# < STARTING CODE >
 
 def scraper(url, resp):
     links = extract_next_links(url, resp)
@@ -216,11 +238,11 @@ def extract_next_links(url, resp):
     #         resp.raw_response.url: the url, again
     #         resp.raw_response.content: the content of the page!
     # Return a list with the hyperlinks (as strings) scrapped from resp.raw_response.content
-    if not _is_successful_response(resp):
+    if not is_successful_response(resp):
         return []
 
     page_bytes = resp.raw_response.content
-    if not _has_acceptable_size(page_bytes):
+    if not has_acceptable_size(page_bytes):
         return []
 
     base_url = resp.raw_response.url or resp.url or url
@@ -235,61 +257,61 @@ def extract_next_links(url, resp):
 
     page_text = soup.get_text(separator=" ")
 
-    is_content_bearing = _has_sufficient_text_density(page_text, page_bytes)
-    meaningful_word_tokens = _meaningful_tokens_from_text(page_text)
+    is_content = has_text_density(page_text, page_bytes)
+    tokens = meaningful_tokens(page_text)
 
-    if is_content_bearing and len(meaningful_word_tokens) < MIN_CONTENT_TOKENS:
-        is_content_bearing = False
+    if is_content and len(tokens) < MIN_CONTENT_TOKENS:
+        is_content = False
 
-    if is_content_bearing:
-        content_hash = _content_fingerprint(page_text)
-        if content_hash in analytics["content_hashes"]:
-            is_content_bearing = False
+    if is_content:
+        content_hash = fingerprint(page_text)
+        if content_hash in crawler.content_hashes:
+            is_content = False
 
         else:
-            analytics["content_hashes"].add(content_hash)
+            crawler.content_hashes.add(content_hash)
 
-    record_page_analytics(base_url, meaningful_word_tokens, is_content_bearing)
+    crawler.record_page(base_url, tokens, is_content)
 
-    if not is_content_bearing:
+    if not is_content:
         return []
 
-    extracted_links = []
-    seen_target_path_keys = set()
-    target_dir_counts = Counter()
-    for anchor_tag in soup.find_all("a", href=True):
-        href_value = anchor_tag["href"].strip()
-        if not href_value:
+    links = []
+    seen_keys = set()
+    dir_counts = Counter()
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"].strip()
+        if not href:
             continue
 
         try:
-            absolute_url = urljoin(base_url, href_value)
-            defragmented_url, _fragment = urldefrag(absolute_url)
-            if not defragmented_url:
+            abs_url = urljoin(base_url, href)
+            clean_url = urldefrag(abs_url)[0]
+            if not clean_url:
                 continue
 
-            parsed_target = urlparse(defragmented_url)
+            target = urlparse(clean_url)
 
         except ValueError:
             continue
 
-        target_path_key = (parsed_target.netloc, parsed_target.path)
-        if target_path_key in seen_target_path_keys:
+        key = (target.netloc, target.path)
+        if key in seen_keys:
             continue
 
-        seen_target_path_keys.add(target_path_key)
+        seen_keys.add(key)
 
-        if _is_sequential_filename(parsed_target.path):
-            target_hostname = (parsed_target.hostname or "").lower()
-            target_dir_key = _dir_key(target_hostname, parsed_target.path)
-            if target_dir_counts[target_dir_key] >= MAX_SAME_DIR_PER_PAGE:
+        if is_seq_filename(target.path):
+            host = (target.hostname or "").lower()
+            cache_key = dir_key(host, target.path)
+            if dir_counts[cache_key] >= MAX_DIR_PER_PAGE:
                 continue
 
-            target_dir_counts[target_dir_key] += 1
+            dir_counts[cache_key] += 1
 
-        extracted_links.append(defragmented_url)
+        links.append(clean_url)
 
-    return extracted_links
+    return links
 
 
 def is_valid(url):
@@ -302,40 +324,40 @@ def is_valid(url):
             return False
 
         hostname = (parsed.hostname or "").lower()
-        if not _is_in_allowed_domains(hostname):
+        if not is_allowed_domain(hostname):
             return False
 
-        if _has_disallowed_extension(parsed.path):
+        if has_disallowed_extension(parsed.path):
             return False
 
-        if _is_pagination_archive(parsed.path):
+        if is_pagination_path(parsed.path):
             return False
 
-        if _is_low_info_path(parsed.path):
+        if is_low_info_path(parsed.path):
             return False
 
         if len(url) > MAX_URL_LENGTH:
             return False
-        if _has_too_many_path_segments(parsed.path):
+        if has_too_many_segments(parsed.path):
             return False
-        if _has_repeated_path_segments(parsed.path):
+        if has_repeated_segments(parsed.path):
             return False
-        if _looks_like_calendar_trap(parsed):
+        if is_calendar_trap(parsed):
             return False
-        if _is_non_html_export_query(parsed.query):
+        if is_export_query(parsed.query):
             return False
-        if _has_too_many_query_params(parsed.query):
+        if has_too_many_params(parsed.query):
             return False
-        if _path_hit_limit_reached(parsed, hostname):
+        if path_hit_limit_reached(parsed, hostname):
             return False
-        if _seq_dir_limit_reached(parsed, hostname):
+        if seq_dir_limit_reached(parsed, hostname):
             return False
 
-        if _is_sequential_filename(parsed.path):
-            analytics["seq_dir_hits"][_dir_key(hostname, parsed.path)] += 1
+        if is_seq_filename(parsed.path):
+            crawler.seq_dir_hits[dir_key(hostname, parsed.path)] += 1
 
         if parsed.query:
-            analytics["path_hits"][_path_key(hostname, parsed.path)] += 1
+            crawler.path_hits[path_key(hostname, parsed.path)] += 1
 
         return True
 
@@ -350,20 +372,20 @@ def is_valid(url):
 # < HELPER FUNCTIONS >
 
 # Checks for usable HTTP 200 HTML response.
-def _is_successful_response(resp):
+def is_successful_response(resp):
     if resp.status != 200:
         return False
     if resp.raw_response is None:
         return False
     if not resp.raw_response.content:
         return False
-    if not _response_content_type_is_html(resp.raw_response):
+    if not is_html_response(resp.raw_response):
         return False
     return True
 
 
 # Checks Content-Type header for HTML.
-def _response_content_type_is_html(raw_response):
+def is_html_response(raw_response):
     headers = getattr(raw_response, "headers", None)
     if headers is None:
         return True
@@ -380,12 +402,12 @@ def _response_content_type_is_html(raw_response):
 
 
 # Checks page bytes within size bounds.
-def _has_acceptable_size(page_bytes):
+def has_acceptable_size(page_bytes):
     return MIN_PAGE_BYTES <= len(page_bytes) <= MAX_PAGE_BYTES
 
 
 # Checks hostname against allowed domains.
-def _is_in_allowed_domains(hostname):
+def is_allowed_domain(hostname):
     if not hostname:
         return False
 
@@ -397,7 +419,7 @@ def _is_in_allowed_domains(hostname):
 
 
 # Checks for disallowed file extension.
-def _has_disallowed_extension(path):
+def has_disallowed_extension(path):
     return bool(
         re.match(
             r".*\.(css|js|bmp|gif|jpe?g|ico"
@@ -421,25 +443,25 @@ def _has_disallowed_extension(path):
 
 
 # Checks for too many path segments.
-def _has_too_many_path_segments(path):
+def has_too_many_segments(path):
     segments = [segment for segment in path.split("/") if segment]
-    return len(segments) > MAX_PATH_SEGMENTS
+    return len(segments) > MAX_SEGMENTS
 
 
 # Checks for repeated path segments.
-def _has_repeated_path_segments(path):
+def has_repeated_segments(path):
     segments = [segment for segment in path.split("/") if segment]
     if not segments:
         return False
 
     segment_counts = Counter(segments)
-    return max(segment_counts.values()) > MAX_PATH_SEGMENT_REPEATS
+    return max(segment_counts.values()) > MAX_SEGMENT_REPEATS
 
 
 # Detects calendar / date trap URLs.
-def _looks_like_calendar_trap(parsed_url):
-    path = parsed_url.path
-    query = parsed_url.query.lower()
+def is_calendar_trap(parsed):
+    path = parsed.path
+    query = parsed.query.lower()
 
     if re.search(r"/\d{4}-\d{2}-\d{2}/?$", path):
         return True
@@ -457,7 +479,7 @@ def _looks_like_calendar_trap(parsed_url):
 
 
 # Detects non-HTML export query strings.
-def _is_non_html_export_query(query):
+def is_export_query(query):
     if not query:
         return False
     return bool(
@@ -474,7 +496,7 @@ def _is_non_html_export_query(query):
 
 
 # Detects low-information path patterns.
-def _is_low_info_path(path):
+def is_low_info_path(path):
     return bool(re.search(
             r"/(pix|photos?|gallery|galleries|albums?"
             r"|genealogy|family[-_]?tree|ancestry|surnames?"
@@ -486,12 +508,12 @@ def _is_low_info_path(path):
 
 
 # Detects /page/N pagination archives.
-def _is_pagination_archive(path):
+def is_pagination_path(path):
     return bool(re.search(r"/page/\d+(/|$)", path, re.IGNORECASE))
 
 
 # Checks for too many query parameters.
-def _has_too_many_query_params(query):
+def has_too_many_params(query):
     if not query:
         return False
 
@@ -500,42 +522,42 @@ def _has_too_many_query_params(query):
 
 
 # Checks query-variant limit per (host, path).
-def _path_hit_limit_reached(parsed_url, hostname):
-    if not parsed_url.query:
+def path_hit_limit_reached(parsed, hostname):
+    if not parsed.query:
         return False
 
-    path_key = _path_key(hostname, parsed_url.path)
-    return analytics["path_hits"].get(path_key, 0) >= PATH_HIT_LIMIT
+    key = path_key(hostname, parsed.path)
+    return crawler.path_hits.get(key, 0) >= PATH_HIT_LIMIT
 
 
 # Builds (host, path) cache key.
-def _path_key(hostname, path):
+def path_key(hostname, path):
     return f"{hostname}{path}"
 
 
 # Builds (host, directory) cache key.
-def _dir_key(hostname, path):
+def dir_key(hostname, path):
     dir_prefix = path.rsplit("/", 1)[0] + "/"
     return f"{hostname}{dir_prefix}"
 
 
 # Detects sequential / numeric filenames.
-def _is_sequential_filename(path):
+def is_seq_filename(path):
     filename = path.rsplit("/", 1)[-1]
-    return bool(_SEQUENTIAL_FILENAME_RE.match(filename))
+    return bool(SEQ_FILENAME_RE.match(filename))
 
 
 # Checks sequential-file limit per directory.
-def _seq_dir_limit_reached(parsed_url, hostname):
-    if not _is_sequential_filename(parsed_url.path):
+def seq_dir_limit_reached(parsed, hostname):
+    if not is_seq_filename(parsed.path):
         return False
 
-    dir_key = _dir_key(hostname, parsed_url.path)
-    return analytics["seq_dir_hits"].get(dir_key, 0) >= SEQUENTIAL_PAGE_LIMIT
+    key = dir_key(hostname, parsed.path)
+    return crawler.seq_dir_hits.get(key, 0) >= SEQ_PAGE_LIMIT
 
 
 # Checks visible-text density of page.
-def _has_sufficient_text_density(page_text, page_bytes):
+def has_text_density(page_text, page_bytes):
     if not page_bytes:
         return False
 
@@ -544,44 +566,11 @@ def _has_sufficient_text_density(page_text, page_bytes):
 
 
 # Hashes normalized page text.
-def _content_fingerprint(page_text):
+def fingerprint(page_text):
     normalized_text = " ".join(page_text.lower().split())
     return hashlib.md5(normalized_text.encode("utf-8", errors="ignore")).hexdigest()
 
 
-# Updates analytics state for crawled page.
-def record_page_analytics(page_url, meaningful_word_tokens, is_content_bearing):
-    global _pages_since_last_save
-
-    defragmented_url, _fragment = urldefrag(page_url)
-    if not defragmented_url:
-        return
-
-    parsed = urlparse(defragmented_url)
-    hostname = (parsed.hostname or "").lower()
-
-    is_new_url = defragmented_url not in analytics["unique_urls"]
-    if is_new_url:
-        analytics["unique_urls"].add(defragmented_url)
-
-        if hostname == "uci.edu" or hostname.endswith(".uci.edu"):
-            analytics["subdomain_pages"][hostname].add(defragmented_url)
-
-    if is_content_bearing and is_new_url:
-        if len(meaningful_word_tokens) > analytics["longest_page_word_count"]:
-            analytics["longest_page_word_count"] = len(meaningful_word_tokens)
-            analytics["longest_page_url"] = defragmented_url
-
-        for word in meaningful_word_tokens:
-            if word not in STOP_WORDS:
-                analytics["word_counts"][word] += 1
-
-    _pages_since_last_save += 1
-    if _pages_since_last_save >= SAVE_EVERY_N_PAGES:
-        save_analytics()
-        _pages_since_last_save = 0
-
-
 if __name__ == "__main__":
-    generate_report()
+    crawler.generate_report()
     print(f"Report written to {REPORT_FILE}")
